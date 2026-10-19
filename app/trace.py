@@ -10,6 +10,11 @@ Trace 用来回答“这一轮 Agent 到底做了什么”：
 
 存储格式是 JSONL：一行一个 JSON 事件，方便追加、grep 和逐行读取。
 文件路径：<data_dir>/traces/<session_id>.jsonl
+
+为什么不用数据库？
+- MVP 阶段事件量小，JSONL 零依赖、可直接用文本工具排查；
+- 追加写不需要事务，单行写入失败最多影响最后一条；
+- 后续要查询/聚合时，再把事件导入 SQLite 即可。
 """
 
 from __future__ import annotations
@@ -44,9 +49,12 @@ class TraceLogger:
         max_field_chars: int = 2000,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        # traces_dir 可由调用方注入，便于测试使用临时目录。
         self._dir = Path(traces_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
+        # 单个字段最多保留多少字符；防止 raw_output / 工具结果撑爆日志。
         self._max_field_chars = max_field_chars
+        # 时钟可注入，测试中能断言固定时间戳。
         self._clock = clock or (lambda: datetime.now().astimezone())
 
     # ------------------------------------------------------------------
@@ -54,7 +62,12 @@ class TraceLogger:
     # ------------------------------------------------------------------
 
     def log_turn_start(self, *, session_id: str, turn_id: str) -> None:
-        """记录一轮开始，便于计算整轮耗时和串联后续事件。"""
+        """
+        记录一轮开始，便于计算整轮耗时和串联后续事件。
+
+        所有后续事件都带同一个 turn_id，
+        UI/Trace 可以据此把 LLM、工具、压缩事件归到同一轮。
+        """
         self._write(
             session_id,
             {
@@ -73,7 +86,16 @@ class TraceLogger:
         parsed: ParseResult | None = None,
         prompt_tokens_est: int | None = None,
     ) -> None:
-        """记录一次 LLM 调用及其解析结果。"""
+        """
+        记录一次 LLM 调用及其解析结果。
+
+        字段说明：
+        - latency_ms：这一次模型请求的耗时；
+        - prompt_tokens / completion_tokens：API 返回值，部分兼容服务可能为 null；
+        - prompt_tokens_est：本地估算值，用于和 API 用量对账；
+        - raw_output：模型原始输出，截断后保存；
+        - parsed：解析摘要（工具调用 / final / 协议错误）。
+        """
         self._write(
             session_id,
             {
@@ -102,7 +124,12 @@ class TraceLogger:
         tool_input: Mapping[str, Any],
         result: ToolResult,
     ) -> None:
-        """记录一次工具执行。成功和失败都写同一种事件。"""
+        """
+        记录一次工具执行。成功和失败都写同一种事件。
+
+        status 用 ok/error，而不是布尔值：
+        日志里一眼就能看出结果，不需要额外解释 true/false。
+        """
         event: dict[str, Any] = {
             "turn_id": turn_id,
             "step": step,
@@ -137,6 +164,8 @@ class TraceLogger:
         raw_output: str,
     ) -> None:
         """记录模型输出不符合协议的情况。"""
+        # 同时记录 reason 和原始输出：
+        # reason 用于统计哪类错误最多，原始输出用于复现。
         self._write(
             session_id,
             {
@@ -156,6 +185,7 @@ class TraceLogger:
         result: CompressionResult,
     ) -> None:
         """记录一次上下文压缩的效果。"""
+        # before/after 都是估算值，用于观察压缩是否真的降低了 Prompt 体积。
         self._write(
             session_id,
             {
@@ -181,6 +211,8 @@ class TraceLogger:
         reply_preview: str | None = None,
     ) -> None:
         """记录一轮结束和分类统计。"""
+        # stats 来自 TurnStats.to_dict()，
+        # LLM、工具、压缩的调用次数与 token 都分开记录。
         event: dict[str, Any] = {
             "turn_id": turn_id,
             "event": "turn_end",
@@ -216,6 +248,8 @@ class TraceLogger:
             return []
 
         events: list[dict[str, Any]] = []
+        # 逐行读取，而不是一次性 json.load：
+        # JSONL 的每一行都是独立事件，损坏一行不影响其它行。
         with path.open("r", encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -231,6 +265,7 @@ class TraceLogger:
                 if isinstance(event, dict):
                     events.append(event)
 
+        # 只返回最近的 limit 条，避免 API 一次返回整个文件。
         return events[-limit:]
 
     # ------------------------------------------------------------------
@@ -246,14 +281,19 @@ class TraceLogger:
         - 不需要维护长期打开的文件句柄。
         """
         path = self._path_for(session_id)
+        # 统一补上时间戳和 session_id，调用方不需要重复传。
+        # **event 放在后面：如果事件里显式带 ts/session_id，会被保留。
         payload = {
             "ts": self._clock().isoformat(timespec="milliseconds"),
             "session_id": session_id,
             **event,
         }
+        # separators 去掉多余空格，一行更紧凑；ensure_ascii=False 保留中文。
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         with path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(line + "\n")
+            # Trace 是“尽力而为”的可观测性数据：
+            # flush 保证进入操作系统缓冲区，但不做 fsync，避免拖慢主流程。
             handle.flush()
 
         logger.info(
@@ -269,12 +309,21 @@ class TraceLogger:
         return self._dir / f"{session_id}.jsonl"
 
     def _short(self, value: Any, limit: int | None = None) -> str:
-        """把任意值转成短字符串，避免 Trace 被超长内容撑爆。"""
+        """
+        把任意值转成短字符串，避免 Trace 被超长内容撑爆。
+
+        规则：
+        - None -> 空字符串；
+        - 字符串原样处理；
+        - 字典/列表转 JSON；
+        - 其他类型用 str() 兜底。
+        """
         if value is None:
             return ""
         if isinstance(value, str):
             text = value
         elif isinstance(value, Mapping) or isinstance(value, (list, tuple)):
+            # default=str 保证遇到不可序列化对象时也不会抛异常。
             text = json.dumps(value, ensure_ascii=False, default=str)
         else:
             text = str(value)
@@ -286,7 +335,13 @@ class TraceLogger:
 
     @staticmethod
     def _parsed_summary(parsed: ParseResult | None) -> dict[str, Any] | None:
-        """把解析结果压缩成适合落盘的摘要，不保存完整 thought。"""
+        """
+        把解析结果压缩成适合落盘的摘要。
+
+        这里不保存完整 thought：
+        - thought 只对当前轮决策有价值；
+        - 完整保存会让 Trace 迅速变大。
+        """
         if parsed is None:
             return None
         if isinstance(parsed, ToolCall):

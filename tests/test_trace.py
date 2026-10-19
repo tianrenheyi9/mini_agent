@@ -36,6 +36,12 @@ def make_logger(tmp_path: Path) -> TraceLogger:
 
 
 def read_lines(tmp_path: Path, session_id: str = "s_test") -> list[dict]:
+    """
+    直接读取 JSONL 文件并解析每一行。
+
+    测试不经过 read_events()，这样既能验证写入格式，
+    也能独立验证读取函数的过滤逻辑。
+    """
     path = tmp_path / "traces" / f"{session_id}.jsonl"
     return [
         json.loads(line)
@@ -88,7 +94,8 @@ def test_log_llm_call(tmp_path: Path) -> None:
     assert event["prompt_tokens"] == 10
     assert event["completion_tokens"] == 5
     assert event["prompt_tokens_est"] == 99
-    assert len(event["raw_output"]) == 51  # 50 字符 + 省略号
+    # 100 个字符的原始输出被截断到 50 个字符 + 省略号。
+    assert len(event["raw_output"]) == 51
     assert event["parsed"] == {
         "type": "tool_call",
         "action": "weather",
@@ -263,6 +270,7 @@ def test_read_events_returns_last_n_and_skips_corrupt(
         logger.log_turn_start(session_id="s_test", turn_id=turn)
 
     path = tmp_path / "traces" / "s_test.jsonl"
+    # 手动追加一行损坏数据，验证读取时会跳过而不是整体报错。
     with path.open("a", encoding="utf-8") as handle:
         handle.write("{broken json\n")
 
@@ -291,6 +299,7 @@ def test_invalid_session_id_is_rejected(
     """非法 id 不能用于写 Trace。"""
     logger = make_logger(tmp_path)
 
+    # ../evil 这类输入如果不拦截，会写到 traces 目录之外。
     with pytest.raises(ValueError, match="非法的会话 id"):
         logger.log_turn_start(session_id=session_id, turn_id="u_1")
 
