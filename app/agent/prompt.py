@@ -20,7 +20,13 @@ from typing import Any, Protocol
 
 
 class ToolLike(Protocol):
-    """工具目录渲染所需的最小接口，ToolRegistry 中的 ToolSpec 会满足它。"""
+    """
+    工具目录渲染所需的最小接口。
+
+    Protocol 是 Python 的“结构化类型”：
+    只要一个对象拥有下面三个属性，就自动满足这个协议，不需要显式继承。
+    因此后续 ToolRegistry 里的 ToolSpec 可以直接传进来，prompt 模块无需 import 它。
+    """
 
     name: str
     description: str
@@ -41,6 +47,8 @@ def render_tool_catalog(tools: Sequence[ToolLike]) -> str:
 
     blocks: list[str] = []
     for tool in tools:
+        # ensure_ascii=False 让中文描述保持可读，而不是变成 \uXXXX；
+        # indent=2 让 Schema 有换行和缩进，模型更容易准确理解结构。
         schema = json.dumps(
             tool.parameters,
             ensure_ascii=False,
@@ -52,6 +60,8 @@ def render_tool_catalog(tools: Sequence[ToolLike]) -> str:
             f"参数 Schema：\n"
             f"```json\n{schema}\n```"
         )
+
+    # 用空行分隔多个工具，Prompt 里的层级更清楚。
     return "\n\n".join(blocks)
 
 
@@ -67,6 +77,8 @@ def render_todos(todos: Sequence[Mapping[str, Any]]) -> str:
 
     lines: list[str] = []
     for todo in todos:
+        # get 的第二个参数是默认值：
+        # 即使某条待办数据缺字段，也不会抛 KeyError。
         todo_id = str(todo.get("id", "?"))
         content = str(todo.get("content", "")).strip()
         mark = "x" if todo.get("done") else " "
@@ -90,13 +102,20 @@ def build_system_prompt(
     - todos：当前会话的待办列表；
     - now：当前时间，测试时可以传入固定值，保证输出可断言。
     """
+    # now 为空时取当前带时区的时间；
+    # %z 会输出形如 +0800 的时区偏移，避免模型误判“今天”。
     current_time = (now or datetime.now().astimezone()).strftime(
         "%Y-%m-%d %H:%M:%S %z"
     )
+
+    # 空摘要用占位文本，避免 Prompt 里出现一个空段落让模型困惑。
     summary_text = summary.strip() or "（暂无历史摘要）"
+
     catalog = render_tool_catalog(tools)
     todo_text = render_todos(todos)
 
+    # 注意：下面是 f-string，JSON 示例里的花括号必须写成 {{ 和 }}，
+    # 渲染后才会变成单个 { 和 }。
     return f"""你是一个可以调用工具的智能助手。
 你需要根据用户目标、会话摘要和工具执行结果，决定下一步是调用工具还是直接回复。
 
@@ -146,6 +165,9 @@ def build_repair_message(
     原始输出会截断，避免把超长内容再次塞进上下文。
     """
     snippet = raw_output.strip()
+
+    # 只保留前 max_raw_chars 个字符。
+    # 加省略号是为了让模型知道内容被截断了，而不是它原本就这么短。
     if len(snippet) > max_raw_chars:
         snippet = snippet[:max_raw_chars] + "…"
 
