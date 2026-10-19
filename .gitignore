@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .env
 data/
+.claude/launch.json
 .DS_Store
 .idea/
 .vscode/

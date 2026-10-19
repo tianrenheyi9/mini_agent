@@ -1,34 +1,62 @@
 <!doctype html>
-<!-- 第 0 步的占位页；后续会替换为完整的 Session 列表 + 聊天界面。 -->
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Mini Agent</title>
-  <style>
-    body {
-      margin: 0;
-      min-height: 100vh;
-      display: grid;
-      place-items: center;
-      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      background: #f5f6f8;
-      color: #1f2328;
-    }
-    main {
-      padding: 32px 40px;
-      background: #fff;
-      border: 1px solid #e3e6ea;
-      border-radius: 12px;
-    }
-    h1 { margin: 0 0 8px; font-size: 22px; }
-    p { margin: 0; color: #57606a; }
-  </style>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <main>
-    <h1>Mini Agent</h1>
-    <p>骨架已就绪，Agent Runtime 将在后续阶段接入。</p>
-  </main>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">M</div>
+        <div class="brand-copy">
+          <h1>Mini Agent</h1>
+          <p>自研 Agent Runtime</p>
+        </div>
+      </div>
+
+      <button class="new-session" id="new-session" type="button">
+        <span aria-hidden="true">＋</span> 新建会话
+      </button>
+
+      <div class="session-list" id="session-list"></div>
+
+      <div class="sidebar-footer">
+        <span class="dot" id="health-dot"></span>
+        <span id="health-text">连接中…</span>
+      </div>
+    </aside>
+
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <main class="main">
+      <header class="chat-header">
+        <button class="menu-toggle" id="menu-toggle" type="button" aria-label="打开会话列表">☰</button>
+        <div class="header-copy">
+          <h2 id="session-title">未选择会话</h2>
+          <p id="session-meta">从左侧新建一个会话开始</p>
+        </div>
+        <div class="header-badge" id="model-badge" hidden></div>
+      </header>
+
+      <div class="error-banner" id="error-banner" hidden></div>
+
+      <section class="chat" id="chat" aria-live="polite"></section>
+
+      <form class="composer" id="composer">
+        <textarea
+          id="input"
+          rows="1"
+          placeholder="输入任务，Enter 发送"
+          autocomplete="off"
+        ></textarea>
+        <button class="send" id="send" type="submit" disabled>发送</button>
+      </form>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
 </body>
 </html>
