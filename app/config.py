@@ -127,6 +127,7 @@ class Settings:
     max_history_messages: int
     keep_recent_messages: int
     summary_max_chars: int
+    trace_max_chars: int
     data_dir: Path
 
     @property
@@ -174,5 +175,6 @@ def get_settings() -> Settings:
         max_history_messages=_env_int("MAX_HISTORY_MESSAGES", 40),
         keep_recent_messages=_env_int("KEEP_RECENT_MESSAGES", 8),
         summary_max_chars=_env_int("SUMMARY_MAX_CHARS", 800),
+        trace_max_chars=_env_int("TRACE_MAX_CHARS", 2000),
         data_dir=data_dir,
     )

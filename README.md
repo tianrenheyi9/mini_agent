@@ -82,6 +82,7 @@ SUMMARY_MAX_TOKENS=512        # 摘要调用自身的输出上限
 MAX_HISTORY_MESSAGES=40       # 未压缩历史的消息条数硬上限
 KEEP_RECENT_MESSAGES=8        # 压缩后保留的最近消息条数
 SUMMARY_MAX_CHARS=800         # 会话摘要最大字符数
+TRACE_MAX_CHARS=2000          # Trace 中单字段最大字符数
 DATA_DIR=./data               # 会话与 Trace 落盘目录
 ```
 
