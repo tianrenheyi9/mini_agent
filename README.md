@@ -72,7 +72,10 @@ LLM_MAX_TOKENS=1024
 LLM_JSON_MODE=false
 
 TOOL_TIMEOUT_SECONDS=10       # 单个工具执行超时
-MAX_TOOL_STEPS=8              # 单轮用户输入内最多几次 LLM/工具步骤
+MAX_TOOL_STEPS=8              # 单轮最多几次“决策 → 工具”循环
+MAX_LLM_CALLS_PER_TURN=10     # 单轮 LLM 调用上限（含协议纠错）
+MAX_COMPRESSION_CALLS_PER_TURN=1  # 单轮压缩调用上限
+MAX_PARSE_REPAIRS=2           # 单轮协议纠错最多重试几次
 CONTEXT_TOKEN_BUDGET=6000     # 估算 token 超过该值时触发压缩
 MAX_HISTORY_MESSAGES=40       # 未压缩历史的消息条数硬上限
 KEEP_RECENT_MESSAGES=8        # 压缩后保留的最近消息条数
@@ -146,7 +149,7 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 | LLM 基于 Schema 自主决策 | 每轮把工具目录（含完整 Schema）渲染进 System Prompt |
 | 实现 LLM 输出解析逻辑 | `parser.py` 自研：去代码围栏、扫描平衡大括号、容错前后缀文本、校验协议、区分 `thought/action/final` |
 | Session 隔离与续聊 | 每个 Session 独立 JSON 文件 + 独立内存锁；列表/切换/刷新恢复；A/B 窗口互不影响 |
-| 最大轮次限制 | `MAX_TOOL_STEPS`（单轮工具循环上限）+ 压缩后历史窗口 |
+| 最大轮次限制 | 分开限制：`MAX_TOOL_STEPS`（决策循环）、`MAX_LLM_CALLS_PER_TURN`（含纠错）、`MAX_COMPRESSION_CALLS_PER_TURN`（压缩） |
 | 记住之前状态 / 支持追问 | 最近消息窗口 + 会话摘要 + 实时待办快照 + 当前轮工具链 |
 | 纯对话追问 | 历史 user/assistant 消息在 context 中 |
 | 带工具追问 | 历史 + 工具状态快照 + 工具目录持续可见 |
@@ -196,7 +199,8 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 │  │  ├─ search.py            # Mock 搜索（固定语料）
 │  │  └─ weather.py           # Mock 天气（固定规则）
 │  ├─ session/
-│  │  ├─ manager.py           # 创建/列表/读取/追加/锁
+│  │  ├─ models.py            # Session / Message / 统计 / 压缩游标
+│  │  ├─ manager.py           # 创建/读取/删除/会话锁
 │  │  └─ store.py             # JSON 原子读写
 │  ├─ trace.py                # JSONL Trace + 日志
 │  └─ web/
@@ -204,15 +208,27 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 │     ├─ app.js
 │     └─ style.css
 ├─ tests/
-│  ├─ fake_llm.py
-│  ├─ test_parser.py
-│  ├─ test_tools.py
-│  ├─ test_loop.py
-│  ├─ test_sessions.py
-│  ├─ test_context.py
+│  ├─ agent/
+│  │  ├─ test_parser.py
+│  │  ├─ test_prompt.py
+│  │  ├─ test_loop.py
+│  │  ├─ test_context.py
+│  │  └─ test_live_agent.py
+│  ├─ tools/
+│  │  ├─ test_schema.py
+│  │  ├─ test_registry.py
+│  │  ├─ test_calculator.py
+│  │  ├─ test_todo.py
+│  │  ├─ test_search.py
+│  │  └─ test_weather.py
+│  ├─ session/
+│  │  ├─ test_models.py
+│  │  ├─ test_store.py
+│  │  └─ test_manager.py
+│  ├─ llm/
+│  │  └─ test_llm.py
 │  ├─ test_api.py
-│  ├─ test_trace.py
-│  └─ test_live_llm.py
+│  └─ test_trace.py
 ├─ data/                      # 运行时生成（gitignore）
 ├─ .env.example
 ├─ requirements.txt
@@ -246,8 +262,12 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 | AC-16 | LLM 异常 | 超时/5xx 重试后返回可读错误 | `test_loop.py::test_llm_retry_then_fail` |
 | AC-17 | Trace | LLM 调用与工具调用均落 JSONL，含耗时与状态 | `test_trace.py` |
 | AC-18 | API 契约 | 创建/列表/详情/发消息/404 | `test_api.py` |
-| AC-19 | 真实 LLM | 真实模型完成一次工具调用并最终回答 | `test_live_llm.py`（`-m live`） |
+| AC-19 | 真实 LLM | 通过 AgentLoop 完成一次工具调用并最终回答 | `test_live_agent.py`（`-m live`） |
 | AC-20 | 双窗口演示 | 按 1.5 步骤手动复验 | 手工 |
+| AC-21 | 工具结果回填格式 | 不使用缺少 `tool_call_id` 的 `role="tool"`；assistant 原始协议 + user observation | `test_loop.py::test_observation_message_format` |
+| AC-22 | 压缩游标 | 第二次压缩只处理游标之后的新消息，不重复摘要 | `test_context.py::test_compression_cursor_advances` |
+| AC-23 | 分类统计 | LLM 调用、工具调用、压缩次数与 token 分别统计 | `test_loop.py::test_turn_stats` |
+| AC-24 | Calculator 资源上限 | 嵌套乘方在执行前按预估位宽拒绝 | `test_calculator.py::test_nested_power_rejected` |
 
 ---
 
@@ -294,73 +314,99 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 用户 ──▶ POST /messages
           │
           ├─ 1. SessionManager 加锁，加载会话
-          ├─ 2. 追加 user 消息（记录 turn_id）
-          ├─ 3. ContextBuilder 估算 token；超预算 → 压缩旧消息
-          ├─ 4. while step < MAX_TOOL_STEPS:
+          ├─ 2. 追加 user 消息（分配 msg_id，记录 turn_id）
+          ├─ 3. ContextBuilder 估算 token；超预算 → 按游标压缩旧消息
+          ├─ 4. while step < MAX_TOOL_STEPS 且 llm_calls < MAX_LLM_CALLS_PER_TURN:
           │      ├─ 构建 messages（System + 历史窗口 + 当前轮）
           │      ├─ LLMClient.chat() ──▶ 原始文本
           │      ├─ Parser.parse() ──▶ ToolCall | FinalAnswer | ParseError
           │      ├─ FinalAnswer ──▶ 落盘、返回
           │      ├─ ToolCall ──▶ Registry.execute()
-          │      │                  ├─ 未知工具 → observation 回填
-          │      │                  ├─ Schema 失败 → observation 回填
-          │      │                  └─ 成功/异常 → observation 回填
-          │      └─ ParseError → 协议纠错消息重试（最多 2 次）
-          ├─ 5. 超步数 → 汇总已有 observation，返回兜底回复
-          └─ 6. 释放锁，写 Trace，返回 reply + steps
+          │      │                  ├─ 追加 assistant 原始协议消息
+          │      │                  └─ 以 user 角色追加 observation（见 4.4.1）
+          │      └─ ParseError → 协议纠错消息（计入 MAX_PARSE_REPAIRS / MAX_LLM_CALLS_PER_TURN）
+          ├─ 5. 触达任一上限 → 汇总已有 observation，返回兜底回复
+          └─ 6. 释放锁，更新统计，写 Trace，返回 reply + steps
 ```
 
 ### 4.3 Agent Loop（伪代码）
 
 ```python
 async def run_turn(session, user_text):
-    session.append_user(user_text)
+    turn = Turn(turn_id=session.new_turn_id())
+    session.append_user(user_text, turn.id)
 
+    # 压缩按游标增量进行，并受 MAX_COMPRESSION_CALLS_PER_TURN 限制
     if context.over_budget(session):
-        await context.compress(session)          # LLM 增量摘要 + 兜底截断
-
-    turn = Turn(session.id, new_turn_id())
-    repair_budget = 2
+        await context.compress(
+            session,
+            turn,
+            budget=config.MAX_COMPRESSION_CALLS_PER_TURN,
+        )
 
     for step in range(config.MAX_TOOL_STEPS):
+        # 这是独立于工具循环的第二道预算：协议纠错也会消耗 LLM 调用
+        if turn.llm_calls >= config.MAX_LLM_CALLS_PER_TURN:
+            return graceful("本轮 LLM 调用次数已达上限，先给出阶段性结果。")
+
         messages = context.build(session, turn.id)
-        raw = await llm.chat(messages)           # 超时/5xx 内部重试
-        trace.llm_call(turn, step, raw)
+        response = await llm.chat(messages)      # SDK 内部处理超时/重试
 
-        parsed = parser.parse(raw)
+        turn.llm_calls += 1
+        turn.prompt_tokens += response.prompt_tokens or 0
+        turn.completion_tokens += response.completion_tokens or 0
+        trace.llm_call(turn, step, response)
 
-        if parsed.is_final:
-            session.append_assistant_final(parsed.final, parsed.thought, turn.id)
-            return TurnResult(reply=parsed.final, steps=turn.steps)
-            # 注意：工具结果的“结论”已由模型写入 final，后续轮次不再重复注入原始工具输出
+        parsed = parser.parse(response.content)
 
-        if parsed.is_error:
-            if repair_budget == 0:
+        if isinstance(parsed, FinalAnswer):
+            session.append_assistant_final(parsed, turn.id)
+            return TurnResult(reply=parsed.final, steps=turn.steps, stats=turn.stats)
+            # 工具结果的“结论”已由模型写入 final，后续轮次不再重复注入原始工具输出
+
+        if isinstance(parsed, ParseError):
+            if turn.repairs >= config.MAX_PARSE_REPAIRS:
                 return graceful("模型输出格式异常，请重试。")
-            repair_budget -= 1
-            turn.steps.append(parse_error_step(parsed.error))
-            turn.add_repair_message(raw, parsed.error)  # 明确要求只输出 JSON
+            turn.repairs += 1
+            # 保留模型的原始输出，再追加明确的纠错消息
+            session.append_assistant_raw(response.content, turn.id)
+            session.append_user(
+                build_repair_message(response.content, parsed.reason),
+                turn.id,
+                kind="repair",
+            )
             continue
 
-        tool_result = await registry.execute(
+        # ToolCall：先记录模型这次决策，再执行工具
+        session.append_assistant_tool_call(parsed, response.content, turn.id)
+        result = await registry.execute(
             name=parsed.action,
             raw_input=parsed.input,
-            session=session,                     # session_id 由运行时注入，模型不可见
+            context=ToolContext(session_id=session.id, todos=session.todos),
         )
-        turn.steps.append(tool_result)
-        session.append_tool_step(parsed.action, parsed.input, tool_result, turn.id)
-        # observation 已进入当前轮 messages，下一轮 LLM 可见
 
-    return graceful("已达到单轮最大工具调用次数（%d），先给你阶段性结果。" % MAX_TOOL_STEPS)
+        turn.tool_calls += 1
+        # 自定义协议不使用 role="tool"；
+        # 工具结果以 user 角色的显式 observation 回填（见 4.4.1）
+        session.append_tool_observation(parsed, result, turn.id)
+        trace.tool_call(turn, step, parsed, result)
+
+    return graceful(
+        "已达到单轮最大工具循环次数（%d），先给你阶段性结果。"
+        % config.MAX_TOOL_STEPS
+    )
 ```
 
 **终止条件**（任一满足）：
 
 1. 解析出 `final` → 正常返回；
-2. 达到 `MAX_TOOL_STEPS` → 兜底返回；
-3. 协议修复次数耗尽 → 错误提示；
-4. LLM 重试耗尽 → 错误提示；
-5. 客户端断开 → 取消协程（取消时也写 Trace）。
+2. 达到 `MAX_TOOL_STEPS`（决策循环上限）→ 兜底返回；
+3. 达到 `MAX_LLM_CALLS_PER_TURN`（含协议纠错）→ 兜底返回；
+4. 达到 `MAX_PARSE_REPAIRS` → 格式异常提示；
+5. LLM 重试耗尽 → 错误提示；
+6. 客户端断开 → 取消协程（取消时也写 Trace）。
+
+**统计口径**：`TurnStats` 分开记录 `llm_calls`、`tool_calls`、`compression_calls`、`prompt_tokens`、`completion_tokens`；Session 再累计一份，供 Trace 和 UI 展示。
 
 ### 4.4 LLM 输出协议与解析器
 
@@ -403,6 +449,56 @@ async def run_turn(session, user_text):
 - 不依赖特定厂商的 tools 能力，任何 OpenAI 兼容模型都能跑；
 - `thought` 字段让思考过程显式可观测，便于 UI 展示与调试。
 
+#### 4.4.1 工具结果如何回填（重要）
+
+自定义 JSON 协议**不是** OpenAI 原生 `tool_calls`。因此不能直接发送：
+
+```python
+{"role": "tool", "content": "..."}  # 缺少 tool_call_id，API 会拒绝或行为异常
+```
+
+本项目采用“**assistant 原始协议 + user observation**”：
+
+```python
+# 1. 原样保留模型刚才的决策
+{
+    "role": "assistant",
+    "content": '{"action":"calculator","input":{"expression":"2**10"}}',
+}
+
+# 2. 用 user 角色回填工具结果
+{
+    "role": "user",
+    "content": """[工具执行结果]
+tool: calculator
+status: ok
+input: {"expression": "2**10"}
+result: {"result": 1024}
+
+请继续：需要更多信息就调用工具，否则输出 final。""",
+}
+```
+
+失败时同样回填，但标记为 error：
+
+```text
+[工具执行结果]
+tool: weather
+status: error
+input: {"city": ""}
+error: 城市不能为空
+请修正参数后重试，或向用户说明原因。
+```
+
+这样做的原因：
+
+- 不需要伪造 `tool_call_id`；
+- 模型能看到“自己刚才做了什么”和“工具返回了什么”，支持多步串联；
+- 与自定义协议完全一致，不混用两套调用机制；
+- `[工具执行结果]` 是显式标记，避免模型把 observation 误认为新的用户需求。
+
+**不要同时使用 `role="tool"` 和自定义协议**：那会形成一套不完整的原生工具调用消息，容易导致 API 报错或模型混淆。
+
 ### 4.5 工具系统
 
 **注册机制**：
@@ -417,13 +513,13 @@ class ToolSpec:
 ```
 
 - `ToolRegistry.register(spec)`：名称重复直接报错（启动期暴露问题）；
-- `ToolRegistry.catalog()`：生成 System Prompt 中的工具目录；
-- `ToolRegistry.execute(name, raw_input, session)`：
-  1. 查找工具（未知 → 可回填错误）；
-  2. 用自研 `validate(schema, raw_input)` 校验 `required/type/enum/properties/items`；
-  3. 运行时注入 `session`（模型看不到 `session_id`，防止越权/串会话）；
-  4. 执行并统一包装为 `ToolResult(status, data, error, duration_ms)`；
-  5. 异常捕获，返回可读错误，完整堆栈只进 Trace。
+- `ToolRegistry.tools()`：返回全部 ToolSpec，交给 `prompt.py` 渲染工具目录；
+- `ToolRegistry.execute(name, raw_input, context)`：
+  1. 查找工具（未知 → 返回可用工具列表）；
+  2. 用自研 `validate_parameters(schema, raw_input)` 校验 `required/type/enum/properties/items`；
+  3. Runtime 注入 `ToolContext`（含 `session_id` 与 `todos`，模型看不到这些内部字段）；
+  4. 执行并统一包装为 `ToolResult(tool, ok, data, error, duration_ms)`；
+  5. 异常捕获，返回可读错误，完整堆栈只进日志/Trace。
 
 **四个工具**：
 
@@ -457,16 +553,63 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
   "created_at": "2026-10-18T12:00:00+08:00",
   "updated_at": "2026-10-18T12:03:00+08:00",
   "summary": "用户询问北京天气并把买礼物加入待办……",
+  "summary_until_msg_id": "m_6",
+  "next_msg_seq": 7,
+  "stats": {
+    "llm_calls": 3,
+    "tool_calls": 2,
+    "compression_calls": 1,
+    "prompt_tokens": 1832,
+    "completion_tokens": 210
+  },
   "todos": [
     { "id": "t_1", "content": "给妈妈买生日礼物", "done": false, "created_at": "..." }
   ],
   "messages": [
-    { "role": "user", "content": "...", "turn_id": "u_1", "created_at": "..." },
-    { "role": "assistant", "content": "...", "thought": "...", "turn_id": "u_1", "created_at": "..." },
-    { "role": "tool", "tool": "weather", "input": {}, "result": {}, "turn_id": "u_1", "created_at": "..." }
+    { "msg_id": "m_1", "role": "user", "content": "...", "turn_id": "u_1", "created_at": "..." },
+    {
+      "msg_id": "m_2",
+      "role": "assistant",
+      "kind": "tool_call",
+      "content": "{\"action\":\"weather\",\"input\":{\"city\":\"北京\"}}",
+      "thought": "先查天气",
+      "turn_id": "u_1",
+      "created_at": "..."
+    },
+    {
+      "msg_id": "m_3",
+      "role": "user",
+      "kind": "tool_observation",
+      "tool": "weather",
+      "status": "ok",
+      "content": "[工具执行结果] tool=weather status=ok ...",
+      "turn_id": "u_1",
+      "created_at": "..."
+    },
+    {
+      "msg_id": "m_4",
+      "role": "assistant",
+      "kind": "final",
+      "content": "北京今天 18~26℃，多云。",
+      "thought": "信息已足够",
+      "turn_id": "u_1",
+      "created_at": "..."
+    }
   ]
 }
 ```
+
+**三个关键字段**：
+
+| 字段 | 作用 |
+| --- | --- |
+| `msg_id` | 会话内单调递增（`m_1`、`m_2`…），永不复用；压缩游标和 UI 定位都依赖它 |
+| `next_msg_seq` | 下一条消息的序号；落盘保存，避免重启后 id 回退 |
+| `summary_until_msg_id` | 摘要已经覆盖到的最后一条消息；压缩时只处理它之后的新消息，避免重复摘要 |
+| `stats` | 累计统计 LLM 调用、工具调用、压缩次数与 token，和 `MAX_TOOL_STEPS` 等限制分开 |
+
+**消息 `kind`**：`user` / `final` / `tool_call` / `tool_observation` / `repair`。
+历史轮次进入上下文时只取 `user` 原文与 `final`；`tool_call`、`tool_observation`、`repair` 供当前轮推理、UI 和 Trace 使用。
 
 **隔离与并发**：
 
@@ -475,6 +618,8 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 - 写入采用“临时文件 + `os.replace`”原子替换，避免半写文件；
 - 列表接口只读取元数据（启动时可用轻量索引），按 `updated_at` 倒序；
 - URL Hash `#/s/<id>` 绑定会话：两个浏览器窗口天然是两条独立会话，刷新可恢复。
+
+**消息不删除**：压缩只推进 `summary_until_msg_id`，不改写历史消息；UI 与 Trace 仍能看到完整过程。
 
 **首条消息生成标题**：取首条用户消息前 20 个字符作为标题（失败/为空则“新会话”），无需额外 LLM 调用。
 
@@ -499,12 +644,14 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 | System 角色与输出协议 | `prompt.py` 常量 | System Prompt 开头 | 每次 LLM 调用 | 协议必须最高优先级、每轮可见 |
 | 工具目录（名称/描述/Schema） | `ToolRegistry` | System Prompt | 每次 LLM 调用 | 让模型基于真实 Schema 决策，避免臆造参数 |
 | 会话摘要 | `session.summary` | System Prompt | 每轮构建上下文时 | 压缩后的长期事实，放在 system 中不影响消息配对 |
+| 摘要游标 | `session.summary_until_msg_id` | 不进入 Prompt | 每次压缩 | 只摘要游标之后的新消息，防止重复摘要 |
+| 运行统计 | `session.stats` / `TurnStats` | Trace / TurnResult | 每轮结束 | LLM、工具、压缩次数与 token 分开统计 |
 | 待办快照 | `session.todos` | System Prompt | 每轮**实时生成** | 状态类事实以存储为准，避免模型“记忆漂移” |
 | 当前时间 | 运行时 | System Prompt | 每轮 | 支持“今天/本周”等相对时间 |
 | 最近 N 条已完成对话 | `session.messages` | messages 数组尾部 | 每轮 | 保证追问连贯，控制 token |
 | 当前轮的 user 输入 | `session.messages` | messages 数组 | 当前轮 | 直接任务输入 |
 | 当前轮的 assistant 工具调用 | `session.messages` | messages 数组 | 同一轮内后续步骤 | 多步工具串联必需（模型要知道上一步调了什么） |
-| 当前轮的工具 observation | `session.messages` | messages 数组 | 同一轮内后续步骤 | 工具结果是本轮推理依据 |
+| 当前轮的工具 observation | `session.messages` | messages 数组（user 角色 + `[工具执行结果]` 标记） | 同一轮内后续步骤 | 工具结果是本轮推理依据；不使用缺少 `tool_call_id` 的 `role="tool"` |
 | **历史轮的中间工具调用/结果** | `session.messages`（供 UI/Trace） | **默认不进入上下文** | 不召回 | final 已沉淀结论；原始结果重复注入会快速膨胀 |
 | **历史轮的 thought** | `session.messages`（供 UI/Trace） | **不进入上下文** | 不召回 | 思考过程只对当轮决策有效，历史 thought 会干扰后续 |
 | 完整 Trace | `data/traces/*.jsonl` | 不进入上下文 | 仅排障 | 可观测性数据，不属于对话记忆 |
@@ -523,9 +670,11 @@ messages = [
   },
   ...最近 K 条已完成轮次（仅 user 原文 + assistant final）,
   { role: "user", content: 当前输入 },
-  ...当前轮中间步骤（assistant 工具调用 + tool observation）,
+  ...当前轮中间步骤（assistant 原始协议 + user observation）,
 ]
 ```
+
+工具 observation 的放置方式很关键：它使用 **user 角色**并带 `[工具执行结果]` 标记，而不是 `role="tool"`。原因见 [4.4.1](#441-工具结果如何回填重要)。
 
 ### 5.3 追问为什么能工作
 
@@ -565,16 +714,32 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 
 ```text
 保留：最近 KEEP_RECENT_MESSAGES（默认 8）条已完成消息
-摘要输入：旧摘要 + 被淘汰的较早消息（user 原文、assistant final、工具调用摘要）
+摘要范围：summary_until_msg_id 之后、最近窗口之前的消息
+摘要输入：旧摘要 + 这批新消息（user 原文、assistant final、工具调用摘要）
 摘要输出：≤ SUMMARY_MAX_CHARS 的结构化文本：
   1. 用户目标与偏好
   2. 已确认的关键事实/数字
   3. 已完成的工具操作及其结论
   4. 当前待办与未决问题
-写回：session.summary（原子落盘），消息不删除（供 UI/Trace），但不再进入上下文
+写回：session.summary
+      session.summary_until_msg_id = 最后一条被摘要消息的 msg_id
+      session.stats.compression_calls += 1
+消息不删除（供 UI/Trace），但游标之前的消息不再直接进入上下文
 ```
 
-**增量摘要**：不是每次从零重算，而是 `new_summary = summarize(old_summary + dropped_messages)`，避免信息在多次压缩中反复丢失。
+**增量摘要有两个前提**：
+
+1. `new_summary = summarize(old_summary + new_dropped_messages)`，而不是从零重算；
+2. **游标只前进不后退**。第二次压缩时，`m_1..m_12` 已经被摘要覆盖，不会再被送进摘要器，避免重复消耗 token 和摘要失真。
+
+**游标之后没有新消息、但仍然超预算**怎么办？
+说明最近窗口本身太大（例如单条工具结果极长）。此时降级为对最近窗口做字符截断，或临时缩小 `KEEP_RECENT_MESSAGES`，并记录 `event=compress, fallback=truncate`。
+
+**分类统计**：
+
+- `compression_calls`：压缩 LLM 调用次数（受 `MAX_COMPRESSION_CALLS_PER_TURN` 限制）；
+- `compression_prompt_tokens` / `compression_completion_tokens`：压缩自身消耗；
+- 与主循环的 `llm_calls`、`tool_calls` 分开记录，不混为一个 `MAX_TOOL_STEPS`。
 
 **兜底**：
 
@@ -600,7 +765,10 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 | 参数 Schema 校验失败 | 把具体字段错误回填 | 模型自我纠正 |
 | 工具执行抛异常 | 捕获并回填“工具执行失败：<安全信息>”，堆栈只进 Trace | 模型解释或改用其他方式 |
 | 工具超时 | 每个工具 10s 超时，视同执行失败 | 同上 |
-| 超过 `MAX_TOOL_STEPS` | 终止循环，返回阶段性结果说明 | 明确告知步数上限 |
+| 超过 `MAX_TOOL_STEPS` 或 `MAX_LLM_CALLS_PER_TURN` | 终止循环，返回阶段性结果说明 | 明确告知步数/调用上限 |
+| 协议纠错达到 `MAX_PARSE_REPAIRS` | 停止重试，返回格式异常提示 | “模型输出格式异常，请重试。” |
+| 压缩达到 `MAX_COMPRESSION_CALLS_PER_TURN` | 跳过后续压缩，降级为硬截断 | 对话继续 |
+| calculator 嵌套乘方 | 执行 `**` 前按预估位宽拒绝，不先算出大整数 | 模型看到“计算结果过大”并调整 |
 | 会话不存在 / ID 非法 | API 返回 404/400 | UI 提示并回到会话列表 |
 | 同一会话并发请求 | 会话锁串行化 | 稍候自动完成 |
 | 磁盘写失败 | 返回 500，日志记录；内存状态不提交 | 提示重试 |
@@ -622,8 +790,9 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 {"ts":"2026-10-18T12:00:01.130+08:00","session_id":"s_01J...","turn_id":"u_1","step":0,"event":"tool_call","tool":"weather","input":{"city":"北京"},"status":"ok","latency_ms":2,"result_preview":"{\"city\":\"北京\",\"temp\":\"18~26℃\"}"}
 {"ts":"2026-10-18T12:00:01.950+08:00","session_id":"s_01J...","turn_id":"u_1","step":1,"event":"llm_call","latency_ms":790,"parsed":{"type":"tool_call","action":"todo"}}
 {"ts":"2026-10-18T12:00:02.001+08:00","session_id":"s_01J...","turn_id":"u_1","step":1,"event":"tool_call","tool":"todo","input":{"action":"add","content":"给妈妈买生日礼物"},"status":"ok"}
+{"ts":"2026-10-18T12:00:02.300+08:00","session_id":"s_01J...","turn_id":"u_1","event":"compress","before_tokens_est":7200,"after_tokens_est":4100,"summarized_messages":6,"summary_until_msg_id":"m_12","fallback":null}
 {"ts":"2026-10-18T12:00:02.900+08:00","session_id":"s_01J...","turn_id":"u_1","step":2,"event":"llm_call","parsed":{"type":"final"}}
-{"ts":"2026-10-18T12:00:02.901+08:00","session_id":"s_01J...","turn_id":"u_1","event":"turn_end","status":"ok","steps":2,"latency_ms":1801}
+{"ts":"2026-10-18T12:00:02.901+08:00","session_id":"s_01J...","turn_id":"u_1","event":"turn_end","status":"ok","steps":2,"llm_calls":3,"tool_calls":2,"compression_calls":1,"prompt_tokens":1832,"completion_tokens":210,"latency_ms":1801}
 ```
 
 ### 8.2 日志输出
@@ -706,20 +875,26 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 **工具**
 - 重复注册报错；目录渲染包含全部 4 个工具；
 - `calculator`：优先级、括号、负数、除零、`__import__`/函数调用/属性访问被拒绝；
+- `calculator` 嵌套乘方：`(2**100)**100` 在计算前被预估位宽拦截；
 - `todo`：add → list → complete → delete → clear；未知 id 报错；跨请求持久化；
 - `search`：命中固定语料、无结果、limit 边界；
 - `weather`：同城同日结果稳定、未知城市降级。
 
 **循环**
 - 直接回复；单工具；多工具串联；
+- **observation 消息格式**：assistant 原始协议 + user 角色 `[工具执行结果]`，不含 `role="tool"`；
 - 未知工具 → 自我纠正；参数错误 → 自我纠正；
-- 非法 JSON → 纠错重试；修复次数耗尽 → 兜底；
-- 工具抛异常 → observation 回填；
-- 达到最大步数 → 终止且回复完整；
-- LLM 超时/5xx → 重试 → 最终失败提示。
+- 非法 JSON → 纠错重试；达到 `MAX_PARSE_REPAIRS` → 兜底；
+- 工具抛异常 → observation 回填后继续循环；
+- 达到 `MAX_TOOL_STEPS` 或 `MAX_LLM_CALLS_PER_TURN` → 终止且回复完整；
+- `TurnStats` 分别记录 llm_calls / tool_calls / compression_calls / tokens；
+- LLM 超时/5xx → SDK 重试 → 最终失败提示。
 
 **Session**
 - 两个 Session 交错执行，消息与待办完全隔离；
+- `msg_id` 单调递增、不复用；
+- `summary_until_msg_id` 持久化并在重载后保留；
+- `stats` 累计值与 turn 增量一致；
 - 落盘后新建 Manager 重载，历史/摘要/待办一致；
 - 删除会话同时删除 Trace；
 - 并发请求同一 Session 串行（锁生效）。
@@ -727,18 +902,20 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 **Context**
 - 未超预算不压缩；
 - 超预算触发摘要，摘要进入 System Prompt，最近 K 条原文保留；
+- **游标只前进**：第二次压缩不会重复摘要 `summary_until_msg_id` 之前的消息；
 - 摘要合并旧摘要（增量）；
 - 摘要失败降级截断；
 - 历史工具结果不进入后续上下文（断言 prompt 中不含旧 observation）。
 
 **API**
 - 创建/列表/详情/删除；
-- 发消息返回 reply + steps；
+- 发消息返回 reply + steps + stats；
 - 不存在的 session → 404；空消息 → 422。
 
 **真实 LLM**
-- 发送“2 的 10 次方是多少，然后记一条待办”，断言至少一次工具调用、最终回复包含 `1024`；
-- 断言 todo 落盘。
+- 通过 `AgentLoop` 发送“2 的 10 次方是多少，然后记一条待办”；
+- 断言至少一次工具调用、最终回复包含 `1024`、todo 落盘；
+- **仅调用 `LLMClient.chat()` 回复“你好”不算 Agent 工具调用验收**；live 测试必须走完整循环。
 
 ### 10.3 FakeLLM 设计
 
@@ -754,6 +931,9 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 | 取舍 | 决定 | 原因 / 代价 |
 | --- | --- | --- |
 | 工具协议 | 自研 JSON 协议 | 满足“自行解析”要求、可移植；代价是比原生 tool calling 多一层纠错 |
+| 工具结果回填 | assistant 原始协议 + user observation | 不伪造 `tool_call_id`；代价是模型需要通过 `[工具执行结果]` 文本标记理解 observation |
+| 循环预算 | 步数、LLM 调用、压缩、纠错分别限制 | 避免一个 `MAX_TOOL_STEPS` 混淆不同成本；代价是配置项更多 |
+| 压缩游标 | `summary_until_msg_id` 只前进 | 防止重复摘要和 token 浪费；代价是 Session 模型多一个字段 |
 | 流式输出 | 暂不实现 | MVP 以完整轮次返回；UI 显示步骤时间线。后续可改 SSE 推送 step 事件 |
 | 存储 | JSON 文件 | 零依赖、可读；不适合大规模并发/多实例，后续可换 SQLite/Postgres |
 | 记忆 | 仅会话内 | 题目要求窗口隔离；跨会话检索会引入隐私与串扰问题，列为扩展 |

@@ -118,6 +118,9 @@ class Settings:
     llm_json_mode: bool
     tool_timeout_seconds: float
     max_tool_steps: int
+    max_llm_calls_per_turn: int
+    max_compression_calls_per_turn: int
+    max_parse_repairs: int
     context_token_budget: int
     max_history_messages: int
     keep_recent_messages: int
@@ -158,6 +161,11 @@ def get_settings() -> Settings:
         llm_json_mode=_env_bool("LLM_JSON_MODE", False),
         tool_timeout_seconds=_env_float("TOOL_TIMEOUT_SECONDS", 10.0),
         max_tool_steps=_env_int("MAX_TOOL_STEPS", 8),
+        max_llm_calls_per_turn=_env_int("MAX_LLM_CALLS_PER_TURN", 10),
+        max_compression_calls_per_turn=_env_int(
+            "MAX_COMPRESSION_CALLS_PER_TURN", 1
+        ),
+        max_parse_repairs=_env_int("MAX_PARSE_REPAIRS", 2),
         context_token_budget=_env_int("CONTEXT_TOKEN_BUDGET", 6000),
         max_history_messages=_env_int("MAX_HISTORY_MESSAGES", 40),
         keep_recent_messages=_env_int("KEEP_RECENT_MESSAGES", 8),
