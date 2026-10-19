@@ -4,8 +4,12 @@ const state = {
   current: null,
   // sessionId -> { text }，每个会话独立维护“正在思考”状态
   pending: new Map(),
+  // sessionId -> 输入框草稿；未选会话时使用 NEW_SESSION_DRAFT
+  drafts: new Map(),
   model: "",
 };
+
+const NEW_SESSION_DRAFT = "__new__";
 
 const els = {
   sessionList: document.getElementById("session-list"),
@@ -65,6 +69,23 @@ function el(tag, className, text) {
   return node;
 }
 
+function formatApiDetail(detail) {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        const location = Array.isArray(item.loc)
+          ? item.loc.filter((part) => part !== "body").join(".")
+          : "";
+        const message = item.msg || "参数不合法";
+        return location ? `${location}: ${message}` : message;
+      })
+      .join("；");
+  }
+  return "请求参数不合法";
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -76,10 +97,7 @@ async function api(path, options = {}) {
     try {
       const data = await response.json();
       if (data && data.detail) {
-        message =
-          typeof data.detail === "string"
-            ? data.detail
-            : JSON.stringify(data.detail);
+        message = formatApiDetail(data.detail);
       }
     } catch {
       // 保留状态码提示
@@ -101,7 +119,10 @@ function hasSession(id) {
 }
 
 function showError(message) {
-  els.error.textContent = message;
+  const text = String(message || "请求失败");
+  // 错误条幅只展示摘要，避免把超长校验输入原样铺满页面。
+  els.error.textContent =
+    text.length > 300 ? `${text.slice(0, 300)}…` : text;
   els.error.hidden = false;
 }
 
@@ -269,6 +290,10 @@ async function selectSession(id, { updateHash = true } = {}) {
 
     renderSession(detail);
     renderSessionList();
+    // 恢复目标会话自己的草稿，避免把 A 的未发送内容带到 B。
+    els.input.value = state.drafts.get(id) || "";
+    resizeInput();
+    updateSendState();
     closeSidebar();
     hideError();
   } catch (error) {
@@ -290,6 +315,7 @@ async function deleteSession(id) {
     return;
   }
 
+  state.drafts.delete(id);
   if (state.currentId === id) {
     state.currentId = null;
     state.current = null;
@@ -327,6 +353,8 @@ function renderNoSession() {
   document.title = "Mini Agent";
   els.title.textContent = "未选择会话";
   els.meta.textContent = "从左侧新建一个会话开始";
+  els.input.value = state.drafts.get(NEW_SESSION_DRAFT) || "";
+  resizeInput();
   els.chat.replaceChildren(
     buildEmptyState(
       "从一个具体任务开始",
@@ -652,6 +680,8 @@ async function sendMessage() {
 
   hideError();
   state.pending.set(sessionId, { text });
+  state.drafts.delete(sessionId);
+  state.drafts.delete(NEW_SESSION_DRAFT);
   renderSessionList();
   updateSendState();
 
@@ -674,9 +704,10 @@ async function sendMessage() {
     });
   } catch (error) {
     state.pending.delete(sessionId);
+    // 发送失败时把内容放回草稿，用户不需要重新输入。
+    state.drafts.set(sessionId, text);
     renderSessionList();
     updateSendState();
-    showError(error.message);
 
     if (state.currentId === sessionId) {
       removeTyping();
@@ -685,6 +716,10 @@ async function sendMessage() {
       } catch {
         // 保留当前视图，方便用户重试
       }
+      // selectSession 会 hideError，所以错误提示放在重载之后再显示。
+      showError(error.message);
+    } else {
+      showError(error.message);
     }
     return;
   }
@@ -723,6 +758,10 @@ function bindEvents() {
   });
 
   els.input.addEventListener("input", () => {
+    state.drafts.set(
+      state.currentId || NEW_SESSION_DRAFT,
+      els.input.value
+    );
     resizeInput();
     updateSendState();
   });
