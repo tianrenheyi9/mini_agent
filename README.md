@@ -12,6 +12,7 @@
 
 > 代码仓库：<https://github.com/tianrenheyi9/mini_agent>
 > AI Prompt 与问题解决记录：[`AI_LOG.md`](./AI_LOG.md)
+> 完整执行链（时序图 / 流程图 / 状态图）：[`执行链.md`](./执行链.md)
 
 ---
 
@@ -241,6 +242,7 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
 ├─ .env.example
 ├─ requirements.txt
 ├─ AI_LOG.md                  # AI Prompt 与问题解决记录
+├─ 执行链.md                  # 从用户输入到页面展示的完整执行链
 └─ README.md
 ```
 
