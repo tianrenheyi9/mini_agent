@@ -47,16 +47,21 @@ def make_settings(**overrides: Any) -> Settings:
 
 
 def success_body(content: str = "hello") -> dict[str, Any]:
-    """构造一个最小的 OpenAI 兼容成功响应。"""
+    """构造一个最小的 OpenAI 兼容成功响应（字段满足 SDK 的校验要求）。"""
     return {
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1_700_000_000,
         "model": "test-model",
         "choices": [
             {
+                "index": 0,
                 "message": {"role": "assistant", "content": content},
                 "finish_reason": "stop",
+                "logprobs": None,
             }
         ],
-        "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
     }
 
 
@@ -196,7 +201,12 @@ async def test_missing_config_raises_without_request() -> None:
 async def test_non_json_body_raises_response_error() -> None:
     """HTTP 200 但响应不是 JSON：说明服务端契约不符，抛出 ResponseError。"""
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="not json")
+        # 显式声明 JSON，模拟真实 API 的行为：SDK 会尝试解析并失败。
+        return httpx.Response(
+            200,
+            text="not json",
+            headers={"content-type": "application/json"},
+        )
 
     client = LLMClient(make_settings(), transport=httpx.MockTransport(handler))
 
@@ -204,8 +214,13 @@ async def test_non_json_body_raises_response_error() -> None:
         await client.chat([{"role": "user", "content": "hi"}])
 
 
-async def test_content_parts_are_joined() -> None:
-    """有些兼容接口把 content 返回成分段数组，客户端应拼接成字符串。"""
+async def test_non_text_content_raises_response_error() -> None:
+    """
+    SDK 的协议要求 content 是字符串。
+
+    如果兼容服务返回了数组等非字符串结构，SDK 会校验失败，
+    客户端应把它转换成统一的 LLMResponseError。
+    """
     body = success_body()
     body["choices"][0]["message"]["content"] = [
         {"type": "text", "text": "he"},
@@ -216,15 +231,18 @@ async def test_content_parts_are_joined() -> None:
         return httpx.Response(200, json=body)
 
     client = LLMClient(make_settings(), transport=httpx.MockTransport(handler))
-    result = await client.chat([{"role": "user", "content": "hi"}])
 
-    assert result.content == "hello"
+    with pytest.raises(LLMResponseError):
+        await client.chat([{"role": "user", "content": "hi"}])
 
 
 async def test_empty_choices_raises_response_error() -> None:
     """choices 为空说明响应结构不完整，应该明确报错而不是返回空字符串。"""
+    body = success_body()
+    body["choices"] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"choices": []})
+        return httpx.Response(200, json=body)
 
     client = LLMClient(make_settings(), transport=httpx.MockTransport(handler))
 

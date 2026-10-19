@@ -1,9 +1,9 @@
 # 省心购 Vibe Coding · 最小可用 Agent
 
 一个**不依赖任何 Agent 框架**（无 LangGraph / LangChain / OpenHands 等）的最小可用 Agent Runtime。
-核心循环、工具注册与调度、LLM 输出解析、Session 管理、上下文压缩、异常处理与 Trace 全部自研，底层只使用 HTTP 客户端与 Web 框架。
+核心循环、工具注册与调度、LLM 输出解析、Session 管理、上下文压缩、异常处理与 Trace 全部自研，底层使用 OpenAI 官方 SDK 与 Web 框架。
 
-- 技术栈：Python 3.11+ / FastAPI / httpx / 原生 HTML+CSS+JS（无前端构建步骤）
+- 技术栈：Python 3.11+ / FastAPI / OpenAI SDK（底层 httpx）/ 原生 HTML+CSS+JS（无前端构建步骤）
 - LLM：任意 OpenAI 兼容接口（`BASE_URL + API_KEY + MODEL` 配置）
 - 工具协议：自定义 JSON 协议，由自研解析器提取 `thought / action / final`
 - 会话：Web 端左侧 Session 列表，多个浏览器窗口可分别绑定不同 Session，互不影响
@@ -157,7 +157,7 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 | --- | --- | --- |
 | 语言 | Python 3.11 | Agent 逻辑短、可读性高；pytest 测试生态成熟 |
 | Web | FastAPI + uvicorn | 自带 Pydantic 校验与 OpenAPI；静态文件托管足够本项目 UI |
-| LLM 客户端 | `httpx` 直接请求 `/chat/completions` | 不引入 SDK，协议透明，切换 Provider 零成本 |
+| LLM 客户端 | `openai` SDK（`AsyncOpenAI`） | 官方 SDK 负责请求构造与响应类型解析；`base_url` 兼容任意 Provider，重试与错误映射自行实现 |
 | 前端 | 原生 HTML/CSS/JS | 免构建、免 Node 环境，面试官 `pip install` 即可跑 |
 | 存储 | 每会话一个 JSON + Trace JSONL | 零依赖、可读、易调试；单机 MVP 足够 |
 | Schema 校验 | 自研 JSON Schema 子集校验 | 只支持 `type/required/enum/properties/items`，足以覆盖工具参数，避免过度设计 |

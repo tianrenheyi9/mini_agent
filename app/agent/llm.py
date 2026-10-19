@@ -1,21 +1,24 @@
 """
-OpenAI 兼容的 LLM 客户端。
+基于 OpenAI 官方 SDK 的 LLM 客户端。
 
-为什么不用官方 SDK？
-- 不同厂商的 SDK 接口不统一，切换成本高；
-- 直接发 HTTP 请求更容易看清协议细节，也方便面试时讲解。
+我们使用 `AsyncOpenAI` 负责：
+- 组装并发送 `POST /chat/completions` 请求；
+- 把响应解析成带类型的 Python 对象。
 
-这个客户端负责：
-1. 组装 `POST /chat/completions` 请求；
-2. 设置超时与可选代理；
-3. 遇到临时故障（网络错误、超时、5xx、429）时自动重试；
-4. 把不同失败转换成明确的异常类型；
-5. 从响应中提取文本、token 用量、结束原因和耗时。
+客户端自己负责：
+- 配置检查与超时/代理；
+- 显式重试（0.5s、1.5s）；
+- 把 SDK 的异常转换成项目统一的异常类型；
+- 提取文本、token 用量、结束原因和耗时。
+
+为什么 `max_retries=0`？
+- 官方 SDK 自带重试，但它的等待时间带随机抖动，不方便在测试里精确断言；
+- 关闭 SDK 重试、保留项目自己的重试循环后，重试策略清晰可控，
+  也便于后续把每次重试记录进 Trace。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
@@ -24,6 +27,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI
+from openai.types.chat import ChatCompletion
 
 from app.config import Settings
 
@@ -45,6 +50,8 @@ async def _sleep(seconds: float) -> None:
     这样测试时可以把它替换成“不真正等待”的假函数，
     从而快速验证重试次数，而不必让测试真的等 2 秒。
     """
+    import asyncio
+
     await asyncio.sleep(seconds)
 
 
@@ -77,7 +84,7 @@ class LLMRequestError(LLMError):
 
 
 class LLMResponseError(LLMError):
-    """HTTP 请求成功，但响应内容不符合预期（例如不是 JSON、缺少 choices）。"""
+    """请求成功，但响应内容不符合预期（例如不是 JSON、缺少 choices）。"""
 
 
 @dataclass(frozen=True)
@@ -99,7 +106,7 @@ class LLMResponse:
 
 class LLMClient:
     """
-    LLM 调用客户端。
+    LLM 调用客户端，对外只暴露一个 `chat()` 方法。
 
     `transport` 参数是测试用的“入口”：
     - 生产环境传 None，客户端会正常走网络；
@@ -136,46 +143,43 @@ class LLMClient:
                 "LLM is not configured: set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL"
             )
 
-        # 第 2 步：组装请求地址、请求体和请求头。
-        # rstrip("/") 是为了兼容用户配置成 "https://xxx/v1/" 的情况。
-        url = f"{self._settings.llm_base_url.rstrip('/')}/chat/completions"
-        payload = {
-            "model": self._settings.llm_model,
-            "messages": list(messages),
-            "temperature": temperature,
-            "stream": False,  # MVP 阶段使用非流式响应，逻辑更简单
-        }
-        headers = {
-            "Authorization": f"Bearer {self._settings.llm_api_key}",
-            "Content-Type": "application/json",
-        }
-
-        # 第 3 步：设置超时。总超时控制整个请求，连接超时单独限制在 10 秒内。
+        # 第 2 步：准备底层 HTTP 客户端。
+        # openai SDK 默认自己创建 httpx 客户端；这里显式传入，
+        # 是为了支持测试注入 MockTransport 以及可选的代理配置。
         timeout = httpx.Timeout(
             self._settings.llm_timeout_seconds,
             connect=min(10.0, self._settings.llm_timeout_seconds),
         )
-
-        # 如果配置了代理（访问境外 API 时常用），就传给 httpx。
-        client_kwargs: dict[str, Any] = {
+        http_client_kwargs: dict[str, Any] = {
             "timeout": timeout,
             "transport": self._transport,
         }
         if self._settings.llm_proxy:
-            client_kwargs["proxy"] = self._settings.llm_proxy
+            http_client_kwargs["proxy"] = self._settings.llm_proxy
 
         attempts = len(RETRY_DELAYS_SECONDS) + 1
         started = time.perf_counter()
 
-        # 在同一个 AsyncClient 内完成所有重试，复用连接更高效。
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        async with httpx.AsyncClient(**http_client_kwargs) as http_client:
+            # base_url 指向任意 OpenAI 兼容服务；SDK 会自动拼出 /chat/completions。
+            client = AsyncOpenAI(
+                api_key=self._settings.llm_api_key,
+                base_url=self._settings.llm_base_url,
+                max_retries=0,
+                http_client=http_client,
+            )
+
             for attempt in range(attempts):
-                # 第 4 步：发请求。
-                # httpx.TransportError 是所有网络层异常的基类，
-                # 包括连接失败、读写超时、连接被重置等。
+                # 第 3 步：调用 SDK。SDK 内部会用 httpx 发请求并做响应校验。
                 try:
-                    response = await client.post(url, json=payload, headers=headers)
-                except httpx.TransportError as exc:
+                    completion = await client.chat.completions.create(
+                        model=self._settings.llm_model,
+                        messages=list(messages),
+                        temperature=temperature,
+                        stream=False,
+                    )
+                except APIConnectionError as exc:
+                    # 网络层错误，包括连接失败和超时（APITimeoutError 是它的子类）。
                     if attempt < attempts - 1:
                         delay = RETRY_DELAYS_SECONDS[attempt]
                         logger.warning(
@@ -187,20 +191,18 @@ class LLMClient:
                         )
                         await _sleep(delay)
                         continue
-                    # 最后一次也失败：转换成统一的业务异常，并保留异常链。
                     raise LLMRequestError(
                         f"LLM request failed after {attempts} attempts: {type(exc).__name__}",
                         attempts=attempts,
                     ) from exc
-
-                # 第 5 步：服务端返回了响应，判断状态码。
-                # 5xx / 429 等临时错误：还有重试次数就继续。
-                if response.status_code in RETRYABLE_STATUS_CODES:
-                    if attempt < attempts - 1:
+                except APIStatusError as exc:
+                    # 服务端返回了非 2xx 状态码。
+                    status = exc.status_code
+                    if status in RETRYABLE_STATUS_CODES and attempt < attempts - 1:
                         delay = RETRY_DELAYS_SECONDS[attempt]
                         logger.warning(
                             "LLM returned HTTP %d; retrying in %.1fs (attempt %d/%d)",
-                            response.status_code,
+                            status,
                             delay,
                             attempt + 1,
                             attempts,
@@ -208,101 +210,71 @@ class LLMClient:
                         await _sleep(delay)
                         continue
                     raise LLMRequestError(
-                        f"LLM returned HTTP {response.status_code} after {attempts} attempts: "
-                        f"{_body_snippet(response)}",
-                        status_code=response.status_code,
-                        attempts=attempts,
-                    )
+                        f"LLM returned HTTP {status}: {_status_error_message(exc)}",
+                        status_code=status,
+                        attempts=(
+                            attempts if status in RETRYABLE_STATUS_CODES else attempt + 1
+                        ),
+                    ) from exc
+                except APIError as exc:
+                    # 其余 SDK 错误，典型场景是响应结构校验失败（例如缺少 choices）。
+                    raise LLMResponseError(
+                        f"LLM response error: {type(exc).__name__}"
+                    ) from exc
+                except json.JSONDecodeError as exc:
+                    # SDK 在 200 响应的 body 不是合法 JSON 时会直接抛出底层解析错误。
+                    raise LLMResponseError("LLM returned a non-JSON body") from exc
 
-                # 4xx（如 401 鉴权失败、400 参数错误）重试也不会成功，立即失败。
-                if response.status_code >= 400:
-                    raise LLMRequestError(
-                        f"LLM returned HTTP {response.status_code}: {_body_snippet(response)}",
-                        status_code=response.status_code,
-                        attempts=attempt + 1,
-                    )
-
-                # 第 6 步：2xx 成功响应，解析 JSON 并返回结构化结果。
-                return self._parse_response(response, started)
+                # 第 4 步：请求成功，把 SDK 对象转换成项目自己的 LLMResponse。
+                return self._parse_completion(completion, started)
 
         # 正常情况下上面的循环一定会 return 或 raise；
         # 这行只是为了让类型检查和阅读者明确知道“所有路径都有结果”。
         raise LLMRequestError("LLM request failed", attempts=attempts)
 
-    def _parse_response(self, response: httpx.Response, started: float) -> LLMResponse:
-        """把 OpenAI 格式的响应 JSON 转换成 LLMResponse。"""
+    def _parse_completion(
+        self,
+        completion: ChatCompletion,
+        started: float,
+    ) -> LLMResponse:
+        """把 SDK 的 ChatCompletion 对象转换成 LLMResponse。"""
 
-        # 响应必须是合法 JSON。
-        try:
-            data = response.json()
-        except json.JSONDecodeError as exc:
-            raise LLMResponseError("LLM returned a non-JSON body") from exc
+        # SDK 在响应没有声明 application/json 时，可能把原始文本直接返回。
+        # 这里做一次类型检查，保证上层拿到的永远是结构化结果或明确异常。
+        if not isinstance(completion, ChatCompletion):
+            raise LLMResponseError("LLM response is not a chat completion")
 
-        if not isinstance(data, dict):
-            raise LLMResponseError("LLM response body is not a JSON object")
-
-        # OpenAI 兼容格式的核心结构：
-        # {"choices": [{"message": {"content": "..."}, "finish_reason": "stop"}], ...}
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
+        if not completion.choices:
             raise LLMResponseError("LLM response has no choices")
 
-        choice = choices[0]
-        if not isinstance(choice, dict):
-            raise LLMResponseError("LLM response choice is malformed")
+        choice = completion.choices[0]
+        content = choice.message.content
 
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            raise LLMResponseError("LLM response has no message")
-
-        content = message.get("content")
-
-        # 大多数厂商返回字符串；少数多模态接口会返回分段数组。
-        # 这里把文本段拼起来，保证上层永远拿到字符串。
-        if isinstance(content, list):
-            content = "".join(
-                part["text"]
-                for part in content
-                if isinstance(part, dict) and isinstance(part.get("text"), str)
-            )
+        # SDK 的类型声明是 str | None；None 通常表示模型只返回了工具调用或空响应。
+        if content is None:
+            raise LLMResponseError("LLM response content is empty")
         if not isinstance(content, str):
             raise LLMResponseError("LLM response content is not text")
 
-        # usage 和 finish_reason 不是所有厂商都返回，缺失时用 None。
-        usage = data.get("usage")
-        if not isinstance(usage, dict):
-            usage = {}
-
+        usage = completion.usage
         return LLMResponse(
             content=content,
-            model=str(data.get("model") or self._settings.llm_model),
-            prompt_tokens=_optional_int(usage.get("prompt_tokens")),
-            completion_tokens=_optional_int(usage.get("completion_tokens")),
-            finish_reason=(
-                choice.get("finish_reason")
-                if isinstance(choice.get("finish_reason"), str)
-                else None
-            ),
+            model=completion.model or self._settings.llm_model,
+            prompt_tokens=usage.prompt_tokens if usage else None,
+            completion_tokens=usage.completion_tokens if usage else None,
+            finish_reason=choice.finish_reason,
             latency_ms=int((time.perf_counter() - started) * 1000),
         )
 
 
-def _optional_int(value: Any) -> int | None:
-    """只有值确实是整数时才返回，否则返回 None（避免把字符串当成 token 数）。"""
-    return value if isinstance(value, int) else None
-
-
-def _body_snippet(response: httpx.Response, limit: int = 200) -> str:
+def _status_error_message(exc: APIStatusError, limit: int = 200) -> str:
     """
-    截取响应体的一小段放进错误信息。
+    截取 SDK 异常信息的一小段放进错误消息。
 
     限制长度是为了避免日志被超长 HTML 或堆栈刷屏；
     同时也避免把完整响应（可能含敏感信息）写进日志。
     """
-    try:
-        text = " ".join(response.text.split())
-    except httpx.ResponseNotRead:
-        return "<unreadable body>"
+    text = " ".join(str(exc).split())
     if not text:
-        return "<empty body>"
+        return "<empty error>"
     return text[:limit] + ("..." if len(text) > limit else "")
