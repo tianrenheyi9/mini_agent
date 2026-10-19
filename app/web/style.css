@@ -209,6 +209,21 @@ button {
   color: rgba(241, 239, 228, 0.46);
 }
 
+.session-meta.pending {
+  color: var(--green-bright);
+}
+
+.session-meta.pending::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--green-bright);
+  animation: blink 1.2s infinite ease-in-out;
+}
+
 .session-delete {
   width: 30px;
   border: 0;

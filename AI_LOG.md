@@ -379,6 +379,18 @@ user:      [工具执行结果]
 - 使用真实 `qwen3.8-max` 跑完整 Loop；
 - 断言 calculator 和 todo 实际执行、最终回复包含 1024、todo 落盘。
 
+### 5.14 前端全局发送锁导致无法并行对话
+
+**问题**：`state.sending` 是全局布尔值。A 会话正在执行时切到 B，B 的发送按钮仍显示“思考中”并被禁用，看起来像整个服务被锁住。
+
+**解决**：
+
+- 改为 `state.pending: Map<sessionId, {text}>`，发送状态按 Session 独立维护；
+- 发送按钮、typing 气泡、侧栏“思考中…”都按当前 Session 判断；
+- 切回仍在执行的 Session 时，会恢复 pending 用户消息和 typing；
+- 后端新增 `test_two_sessions_run_concurrently`，用 SlowLLM 证明不同 Session 的 LLM 调用确实并行；
+- 浏览器实测：A 思考中时 B 可正常发送并返回，A 完成后落盘，侧栏状态正确。
+
 ---
 
 ## 6. 测试与验收
@@ -387,7 +399,7 @@ user:      [工具执行结果]
 
 ```bash
 pytest -q
-# 199 passed, 2 deselected
+# 200 passed, 2 deselected
 
 pytest -m live -q
 # 2 passed
@@ -415,11 +427,13 @@ pytest -m live -q
 4. 刷新页面，Hash `#/s/<id>` 恢复会话与工具时间线；
 5. 新建第二个会话做纯对话，两个会话的消息/待办互不影响；
 6. 切回第一个会话，历史与待办正确恢复；
-7. 浏览器控制台无报错。
+7. A 会话发送长任务时切到 B：B 的发送按钮可用，B 正常返回；侧栏 A 仍显示“思考中…”；
+8. A 完成后其回复、历史与待办正确落盘；
+9. 浏览器控制台无报错。
 
 ### 6.3 验收标准
 
-README 第 3 节 AC-01~AC-29 均有对应测试或手工步骤，已于 2026-10-19 完成走查。
+README 第 3 节 AC-01~AC-30 均有对应测试或手工步骤，已于 2026-10-19 完成走查。
 
 ---
 

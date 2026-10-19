@@ -281,11 +281,12 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
 | AC-27 | Trace 故障隔离 | Trace 写盘/读取失败只记日志，不影响 Agent 回复 | `tests/test_trace.py::test_write_failure_is_isolated` |
 | AC-28 | 客户端复用与 JSON Mode | LLM 客户端复用并在 shutdown 关闭；摘要显式关闭 JSON Mode | `tests/llm/test_llm.py::test_client_is_created_with_settings` / `tests/agent/test_context.py::test_compress_updates_summary_cursor_and_stats` |
 | AC-29 | 当前轮 observation 预算 | 长工具结果先分级截断/省略，不因工具输出让用户收到“输入过长” | `tests/agent/test_context.py::test_current_turn_observations_are_compacted` / `tests/agent/test_loop.py::test_large_tool_output_is_compacted` |
+| AC-30 | 多会话并发 | 不同 Session 的请求可同时执行；前端发送状态按 Session 独立维护 | `tests/agent/test_loop.py::test_two_sessions_run_concurrently` + 浏览器手工验证 |
 
-> **2026-10-19 验收结果**：AC-01~AC-29 全部通过。
-> - 自动化：`pytest -q` → **199 passed, 2 deselected**
+> **2026-10-19 验收结果**：AC-01~AC-30 全部通过。
+> - 自动化：`pytest -q` → **200 passed, 2 deselected**
 > - 真实模型：`pytest -m live -q` → **2 passed**
-> - AC-20 已在浏览器中实际验证：calculator + todo、工具时间线、刷新恢复、双会话隔离。
+> - AC-20 / AC-30 已在浏览器中实际验证：calculator + todo、工具时间线、刷新恢复、双会话隔离、A 思考时 B 可正常发送。
 
 ---
 
@@ -660,6 +661,7 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 - 工具时间线从 Session 中持久化的 `tool_call` / `tool_observation` 重建，因此**刷新后仍然存在**，不只依赖当次 POST 响应；
 - URL Hash `#/s/<session_id>` 绑定会话：刷新恢复、两个浏览器窗口天然是两条独立 Session；
 - 输入框：Enter 发送、Shift+Enter 换行；发送中显示“思考中…”并禁用按钮；
+- **发送状态按 Session 独立维护**：A 会话执行中，切到 B 会话仍可发送；侧栏会在 A 上显示“思考中…”；
 - 顶部/侧栏展示模型连接状态；错误以条幅展示；
 - 移动端侧栏自动收起为抽屉；
 - 无构建步骤：FastAPI `StaticFiles` 直接托管 `app/web/`（原生 HTML/CSS/JS）。
@@ -673,7 +675,9 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 3. 展开「思考与工具调用」，能看到 2 步工具记录；
 4. 刷新页面，URL Hash 恢复会话，完整消息与工具时间线仍在；
 5. 新建第二个会话做纯对话，两个会话的消息数与待办互不影响；
-6. 切回第一个会话，历史与待办正确恢复。
+6. 切回第一个会话，历史与待办正确恢复；
+7. 在会话 A 发送长任务，立即切到会话 B：B 的发送按钮可用，B 正常返回；此时侧栏 A 仍显示“思考中…”；
+8. A 完成后，其回复、历史与待办正确落盘。
 
 ---
 
@@ -954,12 +958,14 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 - 工具抛异常 → observation 回填后继续循环；
 - 工具次数达到 `MAX_TOOL_CALLS` 后仍保留一次 final 机会；模型无视提示再次要工具才兜底；
 - 达到 `MAX_LLM_CALLS_PER_TURN` → 终止且回复完整；
+- 不同 Session 可并行；前端 pending 状态按 Session 隔离；
 - 上下文超预算 → 先分级压缩当前轮 observation；仍超限才 `context_overflow`；
 - `TurnStats` 分别记录 llm_calls / tool_calls / compression_calls / tokens；
 - LLM 超时/5xx → SDK 重试 → 最终失败提示。
 
 **Session**
 - 两个 Session 交错执行，消息与待办完全隔离；
+- **不同 Session 的 LLM 调用并行执行**；同一 Session 仍由锁串行；
 - `msg_id` 单调递增、不复用；
 - `summary_until_msg_id` 持久化并在重载后保留；
 - `stats` 累计值与 turn 增量一致；

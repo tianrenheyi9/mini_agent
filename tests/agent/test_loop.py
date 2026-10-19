@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 import pytest
 
 from app.agent.context import ContextManager
-from app.agent.llm import LLMConfigError, LLMRequestError
+from app.agent.llm import LLMConfigError, LLMRequestError, LLMResponse
 from app.agent.loop import AgentLoop
 from app.config import Settings, get_settings
 from app.session.manager import SessionManager
@@ -632,6 +633,75 @@ async def test_turn_stats(tmp_path: Path) -> None:
 
     reloaded = sessions.get(session.id)
     assert reloaded.stats.to_dict() == result.stats
+
+
+async def test_two_sessions_run_concurrently(tmp_path: Path) -> None:
+    """不同 Session 的 LLM 调用应并行，而不是全局串行。"""
+
+    class SlowLLM:
+        def __init__(self, delay: float = 0.05) -> None:
+            self.delay = delay
+            self.active = 0
+            self.max_active = 0
+
+        async def chat(
+            self,
+            messages: Any,
+            *,
+            temperature: float | None = None,
+            max_tokens: int | None = None,
+            json_mode: bool | None = None,
+        ) -> LLMResponse:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(self.delay)
+            finally:
+                self.active -= 1
+            return LLMResponse(
+                content='{"final": "完成"}',
+                model="slow",
+                prompt_tokens=0,
+                completion_tokens=0,
+                finish_reason="stop",
+                latency_ms=int(self.delay * 1000),
+            )
+
+    settings = make_settings(
+        max_tool_calls=4,
+        max_llm_calls_per_turn=4,
+        context_token_budget=100000,
+    )
+    llm = SlowLLM()
+    sessions = SessionManager(
+        store=SessionStore(tmp_path / "sessions"),
+        traces_dir=tmp_path / "traces",
+        clock=lambda: FIXED_NOW,
+    )
+    trace = TraceLogger(tmp_path / "traces", clock=lambda: FIXED_NOW)
+    context = ContextManager(settings, llm, clock=lambda: FIXED_NOW)  # type: ignore[arg-type]
+    loop = AgentLoop(
+        settings=settings,
+        llm=llm,  # type: ignore[arg-type]
+        registry=build_default_registry(timeout_seconds=1.0),
+        sessions=sessions,
+        context=context,
+        trace=trace,
+        clock=lambda: FIXED_NOW,
+    )
+
+    first = sessions.create("窗口 1")
+    second = sessions.create("窗口 2")
+
+    results = await asyncio.gather(
+        loop.run_turn(first.id, "第一边的问题"),
+        loop.run_turn(second.id, "第二边的问题"),
+    )
+
+    assert [result.status for result in results] == ["ok", "ok"]
+    assert llm.max_active == 2
+    assert sessions.get(first.id).messages[-1].kind == "final"
+    assert sessions.get(second.id).messages[-1].kind == "final"
 
 
 async def test_empty_input_raises(tmp_path: Path) -> None:

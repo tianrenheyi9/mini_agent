@@ -2,7 +2,8 @@ const state = {
   sessions: [],
   currentId: null,
   current: null,
-  sending: false,
+  // sessionId -> { text }，每个会话独立维护“正在思考”状态
+  pending: new Map(),
   model: "",
 };
 
@@ -120,8 +121,11 @@ function resizeInput() {
 }
 
 function updateSendState() {
-  els.send.disabled = state.sending || !els.input.value.trim();
-  els.send.textContent = state.sending ? "思考中…" : "发送";
+  const isPending = state.currentId
+    ? state.pending.has(state.currentId)
+    : false;
+  els.send.disabled = isPending || !els.input.value.trim();
+  els.send.textContent = isPending ? "思考中…" : "发送";
 }
 
 /* ------------------------------------------------------------------ */
@@ -175,11 +179,14 @@ function renderSessionList() {
     const main = el("button", "session-main");
     main.type = "button";
     main.append(el("span", "session-title", session.title || "新会话"));
+    const pending = state.pending.has(session.id);
     main.append(
       el(
         "span",
-        "session-meta",
-        `${session.message_count} 条消息 · ${session.todo_open_count} 个待办 · ${formatWhen(session.updated_at)}`
+        `session-meta${pending ? " pending" : ""}`,
+        pending
+          ? "思考中…"
+          : `${session.message_count} 条消息 · ${session.todo_open_count} 个待办 · ${formatWhen(session.updated_at)}`
       )
     );
     main.addEventListener("click", () => selectSession(session.id));
@@ -306,20 +313,30 @@ function renderSession(detail) {
   document.title = `${detail.title || "Mini Agent"} · Mini Agent`;
 
   els.chat.replaceChildren();
-  if (!messages.length) {
+  const pending = state.pending.get(detail.id);
+  if (!messages.length && !pending) {
     els.chat.append(
       buildEmptyState(
         "这个会话还没有消息",
         "输入一个任务，Agent 会自己决定是否调用工具。"
       )
     );
+    updateSendState();
     return;
   }
 
   for (const turn of groupTurns(messages)) {
     els.chat.append(renderTurn(turn));
   }
-  scrollToBottom();
+
+  // 切回一个仍在执行的会话时，恢复它的 pending 气泡。
+  if (pending) {
+    appendPendingUser(pending.text);
+    appendTyping();
+  } else {
+    scrollToBottom();
+  }
+  updateSendState();
 }
 
 function groupTurns(messages) {
@@ -575,20 +592,12 @@ function removeTyping() {
 }
 
 async function sendMessage() {
-  if (state.sending) return;
-
   const text = els.input.value.trim();
   if (!text) return;
 
-  hideError();
-  state.sending = true;
-  updateSendState();
-
-  els.input.value = "";
-  resizeInput();
-
-  try {
-    if (!state.currentId) {
+  // 没有当前会话时先创建一个；创建失败就不进入 pending。
+  if (!state.currentId) {
+    try {
       const session = await api("/api/sessions", {
         method: "POST",
         body: JSON.stringify({}),
@@ -596,34 +605,70 @@ async function sendMessage() {
       state.currentId = session.id;
       history.replaceState(null, "", `#/s/${session.id}`);
       await loadSessions();
+      await selectSession(session.id, { updateHash: false });
+    } catch (error) {
+      showError(error.message);
+      return;
     }
+  }
 
-    const sessionId = state.currentId;
+  const sessionId = state.currentId;
+
+  // 同一个会话同一时间只允许一个请求；其他会话不受影响。
+  if (state.pending.has(sessionId)) return;
+
+  hideError();
+  state.pending.set(sessionId, { text });
+  renderSessionList();
+  updateSendState();
+
+  els.input.value = "";
+  resizeInput();
+
+  // 只有当前正在看的会话才更新 DOM；其他会话靠 pending 标记和切回时恢复。
+  if (state.currentId === sessionId) {
+    if (els.chat.querySelector(".empty-state")) {
+      els.chat.replaceChildren();
+    }
     appendPendingUser(text);
     appendTyping();
+  }
 
+  try {
     await api(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
       method: "POST",
       body: JSON.stringify({ content: text }),
     });
-
-    await loadSessions();
-    if (state.currentId === sessionId) {
-      await selectSession(sessionId, { updateHash: false });
-    }
   } catch (error) {
+    state.pending.delete(sessionId);
+    renderSessionList();
+    updateSendState();
     showError(error.message);
-    removeTyping();
-    if (state.currentId) {
+
+    if (state.currentId === sessionId) {
+      removeTyping();
       try {
-        await selectSession(state.currentId, { updateHash: false });
+        await selectSession(sessionId, { updateHash: false });
       } catch {
-        // 保留用户刚才的输入，便于重试
+        // 保留当前视图，方便用户重试
       }
     }
-  } finally {
-    state.sending = false;
-    updateSendState();
+    return;
+  }
+
+  state.pending.delete(sessionId);
+  await loadSessions();
+
+  if (state.currentId === sessionId) {
+    // 先删除 pending 再重新渲染，避免 final 与 typing 同时出现。
+    await selectSession(sessionId, { updateHash: false });
+  } else {
+    // 用户已经切到别的会话：只更新侧栏，不打断当前视图。
+    renderSessionList();
+  }
+  updateSendState();
+
+  if (state.currentId === sessionId) {
     els.input.focus();
   }
 }
