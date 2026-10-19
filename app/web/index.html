@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Mini Agent</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=20261019-5">
 </head>
 <body>
   <div class="app">
@@ -17,9 +17,18 @@
         </div>
       </div>
 
-      <button class="new-session" id="new-session" type="button">
-        <span aria-hidden="true">＋</span> 新建会话
-      </button>
+      <div class="new-actions">
+        <button class="new-session" id="new-session" type="button">
+          <span aria-hidden="true">＋</span> 新建会话
+        </button>
+        <button
+          class="new-window"
+          id="new-window"
+          type="button"
+          title="新建会话并在新窗口打开"
+          aria-label="新建会话并在新窗口打开"
+        >↗</button>
+      </div>
 
       <div class="session-list" id="session-list"></div>
 
@@ -57,6 +66,6 @@
     </main>
   </div>
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=20261019-5"></script>
 </body>
 </html>

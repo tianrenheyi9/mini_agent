@@ -10,6 +10,7 @@ const state = {
 const els = {
   sessionList: document.getElementById("session-list"),
   newSession: document.getElementById("new-session"),
+  newWindow: document.getElementById("new-window"),
   chat: document.getElementById("chat"),
   title: document.getElementById("session-title"),
   meta: document.getElementById("session-meta"),
@@ -38,6 +39,24 @@ const SUGGESTIONS = [
     prompt: "帮我写一份本周周报，3 条要点。",
   },
 ];
+
+// 让多个浏览器窗口的会话列表保持同步；pending 状态仍然按窗口独立。
+const sessionChannel =
+  "BroadcastChannel" in window
+    ? new BroadcastChannel("mini-agent-sessions")
+    : null;
+
+if (sessionChannel) {
+  sessionChannel.addEventListener("message", (event) => {
+    if (event.data?.type === "sessions-updated") {
+      loadSessions();
+    }
+  });
+}
+
+function notifySessionsUpdated() {
+  sessionChannel?.postMessage({ type: "sessions-updated" });
+}
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -75,6 +94,10 @@ async function api(path, options = {}) {
 function parseHash() {
   const match = location.hash.match(/^#\/s\/([A-Za-z0-9_-]+)$/);
   return match ? match[1] : null;
+}
+
+function hasSession(id) {
+  return state.sessions.some((session) => session.id === id);
 }
 
 function showError(message) {
@@ -204,7 +227,7 @@ function renderSessionList() {
   }
 }
 
-async function createSession() {
+async function createSession({ openWindow = false } = {}) {
   try {
     hideError();
     const session = await api("/api/sessions", {
@@ -212,6 +235,15 @@ async function createSession() {
       body: JSON.stringify({}),
     });
     await loadSessions();
+    notifySessionsUpdated();
+
+    if (openWindow) {
+      // 新窗口通过 hash 绑定到全新 Session，和当前窗口天然隔离。
+      const url = `${location.origin}${location.pathname}#/s/${session.id}`;
+      window.open(url, "_blank", "noopener");
+      return;
+    }
+
     await selectSession(session.id);
     closeSidebar();
     els.input.focus();
@@ -265,6 +297,7 @@ async function deleteSession(id) {
     renderNoSession();
   }
   await loadSessions();
+  notifySessionsUpdated();
 }
 
 /* ------------------------------------------------------------------ */
@@ -297,7 +330,7 @@ function renderNoSession() {
   els.chat.replaceChildren(
     buildEmptyState(
       "从一个具体任务开始",
-      "Agent 会自动判断什么时候调用工具，并把思考过程展开给你看。"
+      "Agent 会自动判断什么时候调用工具；每个窗口使用不同会话即可并行对话。"
     )
   );
   updateSendState();
@@ -658,6 +691,7 @@ async function sendMessage() {
 
   state.pending.delete(sessionId);
   await loadSessions();
+  notifySessionsUpdated();
 
   if (state.currentId === sessionId) {
     // 先删除 pending 再重新渲染，避免 final 与 typing 同时出现。
@@ -678,7 +712,10 @@ async function sendMessage() {
 /* ------------------------------------------------------------------ */
 
 function bindEvents() {
-  els.newSession.addEventListener("click", createSession);
+  els.newSession.addEventListener("click", () => createSession());
+  els.newWindow.addEventListener("click", () =>
+    createSession({ openWindow: true })
+  );
 
   els.composer.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -720,6 +757,13 @@ function bindEvents() {
       return;
     }
     if (id !== state.currentId) {
+      if (!hasSession(id)) {
+        // 会话可能已在另一个窗口被删除；避免发一个必然 404 的请求。
+        history.replaceState(null, "", location.pathname);
+        renderNoSession();
+        showError("会话不存在或已被删除");
+        return;
+      }
       selectSession(id, { updateHash: false });
     }
   });
@@ -730,9 +774,13 @@ async function init() {
   await Promise.allSettled([loadHealth(), loadSessions()]);
 
   const id = parseHash();
-  if (id) {
+  if (id && hasSession(id)) {
     await selectSession(id, { updateHash: false });
   } else {
+    if (id) {
+      history.replaceState(null, "", location.pathname);
+      showError("会话不存在或已被删除");
+    }
     renderNoSession();
   }
   updateSendState();

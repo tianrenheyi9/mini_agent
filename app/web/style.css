@@ -111,12 +111,18 @@ button {
   color: rgba(241, 239, 228, 0.58);
 }
 
+.new-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .new-session {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   padding: 11px 14px;
   border: 1px solid rgba(241, 239, 228, 0.2);
   border-radius: 12px;
@@ -125,6 +131,27 @@ button {
   font-size: 14px;
   cursor: pointer;
   transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+}
+
+.new-window {
+  flex: 0 0 42px;
+  width: 42px;
+  border: 1px solid rgba(241, 239, 228, 0.2);
+  border-radius: 12px;
+  background: rgba(241, 239, 228, 0.08);
+  color: #f1efe4;
+  font-size: 16px;
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
+}
+
+.new-window:hover {
+  background: rgba(241, 239, 228, 0.15);
+  border-color: rgba(241, 239, 228, 0.36);
+}
+
+.new-window:active {
+  transform: translateY(1px);
 }
 
 .new-session:hover {
