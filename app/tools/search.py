@@ -4,7 +4,7 @@ search 工具（Mock）。
 笔试允许 mock 搜索。为了保证测试确定性，这里用固定语料 +
 简单的关键词打分，不访问网络。
 
-真实接入时只需要替换 `_search_documents()` 的实现，
+真实接入时只需要替换 `search_documents()` 的实现，
 ToolSpec、参数 Schema 和上层 Agent 都不需要改。
 """
 
@@ -19,7 +19,11 @@ from app.tools.base import (
     split_search_terms,
 )
 
-# 固定语料：id、标题、正文、关键词、URL。
+# 固定语料。
+# 每条文档包含：
+# - id：稳定标识，测试可以断言命中了哪一篇；
+# - title/content/keywords：打分依据；
+# - url：mock 地址，展示“真实搜索”的返回形态。
 _DOCUMENTS: list[dict[str, Any]] = [
     {
         "id": "doc-agent-loop",
@@ -104,6 +108,7 @@ def build_search_tool() -> ToolSpec:
                 "limit": {
                     "type": "integer",
                     "description": "最多返回几条结果，默认 3",
+                    # Schema 校验会在进入 handler 前检查范围。
                     "minimum": 1,
                     "maximum": 5,
                 },
@@ -118,11 +123,15 @@ async def _search_handler(
     input_data: dict[str, Any],
     context: ToolContext,
 ) -> dict[str, Any]:
+    """工具入口：校验查询、打分、截取前 limit 条。"""
     query = input_data["query"].strip()
     if not query:
         raise ToolExecutionError("搜索关键词不能为空")
 
+    # limit 不是必填；没传时默认 3。
     limit = input_data.get("limit", 3)
+
+    # 先得到按相关度排序的完整结果，再按 limit 截断。
     results = search_documents(query)[:limit]
     return {
         "query": query,
@@ -140,12 +149,20 @@ def search_documents(query: str) -> list[dict[str, Any]]:
     - 完整查询出现在关键词：+4
     - 完整查询出现在正文：+3
     - 拆出的词项出现在标题/关键词：+2，出现在正文：+1
+
+    为什么这样设计？
+    - 完整短语命中通常比单个词更相关，所以权重更高；
+    - 中英文混合查询也能工作，不需要引入分词库；
+    - 同样输入永远得到同样输出，测试稳定。
     """
     normalized = query.strip().lower()
     if not normalized:
         return []
 
     terms = split_search_terms(normalized)
+
+    # 保存 (分数, 原始下标, 文档)。
+    # 原始下标用于同分时保持语料顺序。
     scored: list[tuple[int, int, dict[str, Any]]] = []
 
     for index, document in enumerate(_DOCUMENTS):
@@ -169,12 +186,15 @@ def search_documents(query: str) -> list[dict[str, Any]]:
             elif term in content:
                 score += 1
 
+        # 分数为 0 表示完全不相关，不返回。
         if score > 0:
             scored.append((score, index, document))
 
-    # 分数高的在前；同分时保持语料原顺序（Python 的 sorted 是稳定排序）。
+    # 按分数从高到低排序。
+    # Python 的 sorted 是稳定排序，同分时保持原语料顺序，结果因此是确定的。
     scored.sort(key=lambda item: -item[0])
 
+    # 只把用户需要的字段返回给模型，避免把内部打分也塞进上下文。
     return [
         {
             "id": document["id"],
@@ -187,7 +207,7 @@ def search_documents(query: str) -> list[dict[str, Any]]:
 
 
 def _snippet(content: str, limit: int = 120) -> str:
-    """截取正文开头作为摘要。"""
+    """截取正文开头作为摘要，避免返回过长内容。"""
     if len(content) <= limit:
         return content
     return content[:limit] + "…"

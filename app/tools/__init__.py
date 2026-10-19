@@ -1,4 +1,10 @@
-"""工具实现与注册表。"""
+"""
+工具实现与注册表。
+
+这个文件是工具层的“装配入口”：
+- 各个工具模块只负责定义 ToolSpec；
+- 这里把默认工具按顺序注册进一个 ToolRegistry。
+"""
 
 from app.tools.calculator import build_calculator_tool
 from app.tools.registry import ToolRegistry
@@ -13,6 +19,9 @@ def build_default_registry(*, timeout_seconds: float = 10.0) -> ToolRegistry:
 
     注册顺序就是 Prompt 中工具目录的顺序：
     todo（题目必需）放在最前，随后是 calculator、search、weather。
+
+    每个 build_xxx_tool() 都返回一个新的 ToolSpec，
+    因此不同注册表之间不会共享工具状态。
     """
     registry = ToolRegistry(timeout_seconds=timeout_seconds)
     for build_tool in (

@@ -21,16 +21,23 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-# 工具执行函数统一是异步的，参数是“已校验的输入 + 运行上下文”。
+# 工具执行函数的类型别名。
+# 参数 1：已经通过 Schema 校验的 input；
+# 参数 2：Runtime 注入的 ToolContext；
+# 返回值 Awaitable[Any] 表示它必须是一个 async 函数（或返回可 await 对象）。
 ToolHandler = Callable[[dict[str, Any], "ToolContext"], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
 class ToolSpec:
-    """一个工具的静态描述，会被注册到 ToolRegistry。"""
+    """
+    一个工具的静态描述，会被注册到 ToolRegistry。
 
-    name: str  # 唯一名称，模型在 action 字段里使用它
-    description: str  # 告诉模型“什么时候该用这个工具”
+    frozen=True 表示注册后不可修改，避免运行途中工具定义被意外改掉。
+    """
+
+    name: str  # 唯一名称，模型在输出协议的 action 字段里使用它
+    description: str  # 告诉模型“这个工具能做什么、什么时候该用”
     parameters: dict[str, Any]  # JSON Schema，描述 input 的结构
     handler: ToolHandler  # 真正执行工具的函数
 
@@ -48,7 +55,11 @@ class ToolContext:
     """
 
     session_id: str
+
+    # field(default_factory=list) 会为每个 ToolContext 创建独立的空列表。
+    # 如果直接写 todos: list = []，所有实例会共享同一个列表，这是 Python 常见坑。
     todos: list[dict[str, Any]] = field(default_factory=list)
+
     now: datetime | None = None  # 测试时可传入固定时间，保证结果可断言
 
     @property
@@ -59,13 +70,18 @@ class ToolContext:
 
 @dataclass(frozen=True)
 class ToolResult:
-    """工具执行的统一结果，无论成功还是失败都返回它。"""
+    """
+    工具执行的统一结果，无论成功还是失败都返回它。
 
-    tool: str
-    ok: bool
-    data: Any = None
-    error: str | None = None
-    duration_ms: int = 0
+    这样 Agent 循环不需要为每个工具写 try/except：
+    只要检查 ok 字段即可。
+    """
+
+    tool: str  # 工具名，便于 Trace 记录
+    ok: bool  # True 表示成功，False 表示失败
+    data: Any = None  # 成功时的结构化返回值
+    error: str | None = None  # 失败时给模型看的错误信息
+    duration_ms: int = 0  # 执行耗时，便于性能排查
 
 
 class ToolExecutionError(Exception):
@@ -84,12 +100,15 @@ class ToolExecutionError(Exception):
 # 只支持工具参数真正用得到的子集：
 # type / required / properties / items / enum / minimum / maximum。
 # 不追求完整实现 JSON Schema 规范，避免过度设计。
-
+#
+# 字典的 key 是 Schema 里的 type，value 是一个判断函数。
+# 这样校验时只要 _TYPE_CHECKERS[expected_type](value) 即可。
 _TYPE_CHECKERS: dict[str, Callable[[Any], bool]] = {
     "object": lambda value: isinstance(value, dict),
     "array": lambda value: isinstance(value, list),
     "string": lambda value: isinstance(value, str),
-    # 注意：Python 中 bool 是 int 的子类，必须显式排除。
+    # 注意：Python 中 bool 是 int 的子类，
+    # 所以校验 integer 时必须显式排除 True/False。
     "integer": lambda value: isinstance(value, int)
     and not isinstance(value, bool),
     "number": lambda value: isinstance(value, (int, float))
@@ -116,13 +135,16 @@ def validate_parameters(
     # 1. 类型检查。
     if expected_type is not None:
         if not isinstance(expected_type, str) or expected_type not in _TYPE_CHECKERS:
+            # Schema 本身写错了，属于开发期问题，直接返回。
             return [f"{path}: Schema type 配置无效：{expected_type!r}"]
         if not _TYPE_CHECKERS[expected_type](value):
+            # 类型都不对，后面的 required/properties 检查没有意义，直接返回。
             return [
                 f"{path}: 期望 {expected_type}，实际是 {_describe_type(value)}"
             ]
 
     # 2. 枚举检查。
+    # 例如 todo 的 action 只能是 add/list/complete/delete/clear。
     if "enum" in schema:
         allowed = schema["enum"]
         if isinstance(allowed, list) and value not in allowed:
@@ -142,6 +164,8 @@ def validate_parameters(
     if expected_type == "object":
         required = schema.get("required", [])
         if isinstance(required, list):
+            # required 只检查“键是否存在”，不检查值是否为空。
+            # 值是否为空由具体工具根据业务规则判断。
             for key in required:
                 if key not in value:
                     errors.append(f"{path}.{key}: 必填字段缺失")
@@ -149,6 +173,7 @@ def validate_parameters(
         properties = schema.get("properties", {})
         if isinstance(properties, dict):
             for key, child_schema in properties.items():
+                # 只校验实际传了的字段；没传且非必填的字段直接跳过。
                 if key in value and isinstance(child_schema, Mapping):
                     errors.extend(
                         validate_parameters(
@@ -171,7 +196,12 @@ def validate_parameters(
 
 
 def _describe_type(value: Any) -> str:
-    """把 Python 类型转换成更容易读的中文说明。"""
+    """
+    把 Python 类型转换成更容易读的中文说明。
+
+    直接打印 type(value) 会得到 <class 'int'> 这种不友好的文本；
+    这里统一成 string/integer/array 等 Schema 术语。
+    """
     if value is None:
         return "null"
     if isinstance(value, bool):

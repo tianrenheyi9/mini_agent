@@ -17,7 +17,8 @@ from typing import Any
 
 from app.tools.base import ToolContext, ToolExecutionError, ToolSpec
 
-# 城市 -> (基础低温, 温差, 可选天气)
+# 城市 -> (基础低温, 温差, 可选天气)。
+# 这些数字只是让 mock 结果看起来合理，不代表真实气候数据。
 _CITY_PROFILES: dict[str, tuple[int, int, tuple[str, ...]]] = {
     "北京": (18, 8, ("晴", "多云", "阴", "小雨")),
     "上海": (22, 7, ("多云", "阴", "小雨", "晴")),
@@ -26,6 +27,8 @@ _CITY_PROFILES: dict[str, tuple[int, int, tuple[str, ...]]] = {
     "杭州": (21, 8, ("晴", "多云", "小雨", "阴")),
     "成都": (19, 7, ("阴", "小雨", "多云", "晴")),
 }
+
+# 未登记城市使用的默认配置。
 _DEFAULT_PROFILE = (20, 8, ("晴", "多云", "阴", "小雨"))
 
 
@@ -46,6 +49,8 @@ def build_weather_tool() -> ToolSpec:
                 },
                 "date": {
                     "type": "string",
+                    # 不传时由 handler 使用上下文中的当前日期，
+                    # 这样“今天天气”不需要模型自己推算日期。
                     "description": "日期，格式 YYYY-MM-DD；不传则使用今天",
                 },
             },
@@ -59,12 +64,14 @@ async def _weather_handler(
     input_data: dict[str, Any],
     context: ToolContext,
 ) -> dict[str, Any]:
+    """工具入口：确定日期，生成稳定天气，返回结构化结果。"""
     city = input_data["city"].strip()
     if not city:
         raise ToolExecutionError("城市不能为空")
 
     date_text = input_data.get("date")
     if date_text is None or not str(date_text).strip():
+        # 使用 Runtime 注入的时间，测试时可以固定为某一天。
         target_date = context.current_time.date()
     else:
         target_date = _parse_date(str(date_text).strip())
@@ -73,7 +80,7 @@ async def _weather_handler(
     return {
         "city": city,
         "date": target_date.isoformat(),
-        **weather,
+        **weather,  # 把 condition/temperature 等字段展开到同一层
     }
 
 
@@ -82,6 +89,8 @@ def _parse_date(text: str) -> date:
     try:
         return datetime.strptime(text, "%Y-%m-%d").date()
     except ValueError as exc:
+        # 把底层 ValueError 转成工具业务错误，
+        # 让模型看到“格式不对”，而不是一串 Python 异常。
         raise ToolExecutionError("date 必须是 YYYY-MM-DD 格式") from exc
 
 
@@ -90,7 +99,12 @@ def _lookup_weather(city: str, target_date: date) -> dict[str, Any]:
     根据城市和日期生成稳定天气。
 
     使用 hashlib.md5 而不是 Python 内置 hash()：
-    内置 hash() 对字符串带随机盐，进程重启后结果会变。
+    内置 hash() 对字符串带随机盐，进程重启后结果会变；
+    md5 的结果在同一输入下永远一致。
+
+    digest 是一串字节：
+    - digest[0] 用来选择天气现象；
+    - digest[1] 用来生成 -2 ~ +2 的温度偏移。
     """
     base_low, span, conditions = _CITY_PROFILES.get(city, _DEFAULT_PROFILE)
 
@@ -99,7 +113,7 @@ def _lookup_weather(city: str, target_date: date) -> dict[str, Any]:
     ).digest()
 
     condition = conditions[digest[0] % len(conditions)]
-    offset = digest[1] % 5 - 2  # -2 ~ +2
+    offset = digest[1] % 5 - 2  # 0~4 映射到 -2~+2
     low = base_low + offset
     high = low + span
 

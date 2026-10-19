@@ -35,6 +35,8 @@ def build_todo_tool() -> ToolSpec:
             "properties": {
                 "action": {
                     "type": "string",
+                    # enum 让 Schema 校验先拦住未知动作，
+                    # 模型能在 observation 里看到合法取值并自我纠正。
                     "enum": ["add", "list", "complete", "delete", "clear"],
                     "description": "要执行的操作",
                 },
@@ -47,6 +49,8 @@ def build_todo_tool() -> ToolSpec:
                     "description": "待办 id，例如 t_1；action=complete/delete 时必填",
                 },
             },
+            # 基础 JSON Schema 无法表达“当 action=add 时 content 必填”，
+            # 所以这里只要求 action，其余条件在 handler 里判断。
             "required": ["action"],
         },
         handler=_todo_handler,
@@ -57,7 +61,11 @@ async def _todo_handler(
     input_data: dict[str, Any],
     context: ToolContext,
 ) -> dict[str, Any]:
+    """根据 action 分派到具体操作。"""
     action = input_data["action"]
+
+    # 直接使用上下文中的列表（不是拷贝），
+    # 这样工具修改会立即反映到 Session 状态。
     todos = context.todos
 
     if action == "add":
@@ -69,12 +77,15 @@ async def _todo_handler(
             "id": _next_todo_id(todos),
             "content": content,
             "done": False,
+            # current_time 支持测试注入固定时间，保证 created_at 可断言。
             "created_at": context.current_time.isoformat(timespec="seconds"),
         }
         todos.append(todo)
         return {"todo": todo, "count": len(todos)}
 
     if action == "list":
+        # 返回副本列表，避免调用方误改内部列表结构；
+        # 列表里的字典仍然指向原对象。
         return {"todos": list(todos), "count": len(todos)}
 
     if action == "complete":
@@ -90,6 +101,7 @@ async def _todo_handler(
         return {"deleted": deleted, "count": len(todos)}
 
     if action == "clear":
+        # 先记录数量，再清空，否则返回值永远是 0。
         count = len(todos)
         todos.clear()
         return {"cleared": count}
@@ -109,6 +121,7 @@ def _next_todo_id(todos: list[dict[str, Any]]) -> str:
     used_numbers: list[int] = []
     for todo in todos:
         todo_id = todo.get("id")
+        # 只统计形如 t_数字 的 id，避免脏数据导致 int() 报错。
         if (
             isinstance(todo_id, str)
             and todo_id.startswith("t_")
