@@ -68,6 +68,17 @@ def test_exponent_limit() -> None:
         evaluate_expression("2 ** 101")
 
 
+def test_nested_power_rejected_before_computation() -> None:
+    """嵌套乘方按预估位宽拒绝，而不是先算出大整数再检查。"""
+    with pytest.raises(ToolExecutionError, match="计算结果过大"):
+        evaluate_expression("(2**100)**100")
+
+
+def test_nested_power_within_limit() -> None:
+    """预估位宽在上限内的嵌套乘方仍然允许。"""
+    assert evaluate_expression("(2**10)**10") == 2**100
+
+
 def test_overflow_to_infinity() -> None:
     """浮点溢出成 inf 时视为无效结果。"""
     with pytest.raises(ToolExecutionError, match="有限数值"):

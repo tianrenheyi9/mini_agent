@@ -35,6 +35,22 @@ from app.session.models import Message, Session, TurnStats, now_iso
 
 logger = logging.getLogger(__name__)
 
+
+class ContextBudgetExceeded(Exception):
+    """
+    System Prompt + 当前轮本身已经超出预算。
+
+    历史消息可以通过压缩/截断处理，但当前用户输入和正在执行的工具结果
+    不能静默丢弃，所以这里明确报错，由 Agent Loop 转成可读提示。
+    """
+
+    def __init__(self, estimated: int, budget: int) -> None:
+        super().__init__(
+            f"上下文估算 {estimated} token 超过预算 {budget}"
+        )
+        self.estimated = estimated
+        self.budget = budget
+
 # 中日韩字符（含中文、日文假名、韩文）通常接近 1 token/字；
 # 英文和其他字符大约 4 字符/token。
 _CJK_RE = re.compile(
@@ -146,19 +162,24 @@ class ContextManager:
             if message.turn_id == turn_id
         ]
 
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_prompt}
+        system_message = {"role": "system", "content": system_prompt}
+        current_messages = [
+            message.to_llm_message() for message in current_turn
         ]
-        messages.extend(message.to_llm_message() for message in history)
-        messages.extend(message.to_llm_message() for message in current_turn)
 
-        # 4. 最后一道保险：仍然超预算就从最旧历史开始删。
         if trim:
-            messages = self._trim_history_to_budget(
-                messages,
-                history_count=len(history),
+            # 硬截断按“完整轮次”删除历史，避免留下只有 final 没有 user 的片段。
+            return self._trim_history_to_budget(
+                system_message,
+                history,
+                current_messages,
             )
-        return messages
+
+        return (
+            [system_message]
+            + [message.to_llm_message() for message in history]
+            + current_messages
+        )
 
     def _recent_history(
         self,
@@ -203,25 +224,46 @@ class ContextManager:
 
     def _trim_history_to_budget(
         self,
-        messages: list[dict[str, str]],
-        *,
-        history_count: int,
+        system_message: dict[str, str],
+        history: Sequence[Message],
+        current_messages: Sequence[dict[str, str]],
     ) -> list[dict[str, str]]:
         """
-        硬截断兜底：从最旧的历史消息开始删，直到回到预算内。
+        硬截断兜底：按完整轮次从最旧历史开始删。
 
-        messages[0] 是 System Prompt，必须保留；
-        当前轮消息在数组尾部，也不删除。
+        为什么按轮次而不是单条消息？
+        如果只删掉 User A、保留 Assistant A，
+        历史窗口会以一条没有问题的回答开头，模型很难理解。
+
+        如果历史都删完了仍然超预算，说明 System + 当前轮本身过大，
+        此时抛 ContextBudgetExceeded，让上层给出明确提示。
         """
+        remaining = list(history)
+
+        def render() -> list[dict[str, str]]:
+            return (
+                [system_message]
+                + [message.to_llm_message() for message in remaining]
+                + list(current_messages)
+            )
+
         while (
-            history_count > 0
-            and self.estimate_tokens(messages)
+            remaining
+            and self.estimate_tokens(render())
             > self._settings.context_token_budget
         ):
-            # messages[0] 是 System，永远保留；
-            # messages[1] 是当前最旧的历史消息。
-            del messages[1]
-            history_count -= 1
+            # 删除最旧的一整轮：该 turn_id 下的所有可见消息一起删除。
+            oldest_turn = remaining[0].turn_id
+            while remaining and remaining[0].turn_id == oldest_turn:
+                remaining.pop(0)
+
+        messages = render()
+        estimated = self.estimate_tokens(messages)
+        if estimated > self._settings.context_token_budget:
+            raise ContextBudgetExceeded(
+                estimated,
+                self._settings.context_token_budget,
+            )
         return messages
 
     def needs_compression(
@@ -334,6 +376,8 @@ class ContextManager:
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=self._settings.summary_max_tokens,
+                # 摘要是普通文本，不套 JSON；显式关闭，避免全局 JSON Mode 干扰。
+                json_mode=False,
             )
             summary = response.content.strip()
             turn_stats.compression_prompt_tokens += (

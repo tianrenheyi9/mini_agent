@@ -39,7 +39,7 @@ CALCULATOR_CALL = (
 def make_settings(**overrides: Any) -> Settings:
     """给测试一组宽松的默认预算，避免无关的压缩/上限干扰。"""
     values: dict[str, Any] = {
-        "max_tool_steps": 8,
+        "max_tool_calls": 8,
         "max_llm_calls_per_turn": 10,
         "max_parse_repairs": 2,
         "max_compression_calls_per_turn": 1,
@@ -292,24 +292,67 @@ async def test_parse_repair_exhausted(tmp_path: Path) -> None:
     assert kinds == ["user", "raw", "repair", "final"]
 
 
-async def test_max_tool_steps(tmp_path: Path) -> None:
-    """达到最大工具循环次数后返回阶段性结果。"""
+async def test_tool_limit_keeps_final_chance(tmp_path: Path) -> None:
+    """工具次数用完后，仍保留一次生成最终回答的 LLM 调用。"""
     loop, session, llm, trace, sessions = make_loop(
         tmp_path,
         [
             '{"action": "todo", "input": {"action": "list"}}',
             '{"action": "todo", "input": {"action": "list"}}',
+            '{"final": "两次工具结果已经足够。"}',
         ],
-        max_tool_steps=2,
+        max_tool_calls=2,
+        max_llm_calls_per_turn=10,
+    )
+
+    result = await loop.run_turn(session.id, "连续调用两次工具")
+
+    assert result.status == "ok"
+    assert result.reply == "两次工具结果已经足够。"
+    assert result.stats["tool_calls"] == 2
+    assert result.stats["llm_calls"] == 3
+    assert len(result.steps) == 2
+
+
+async def test_tool_limit_forces_model_to_final(tmp_path: Path) -> None:
+    """超过工具上限时不执行，而是提示模型直接收尾。"""
+    loop, session, llm, trace, sessions = make_loop(
+        tmp_path,
+        [
+            '{"action": "todo", "input": {"action": "list"}}',
+            '{"action": "todo", "input": {"action": "list"}}',
+            '{"final": "基于已有结果收尾。"}',
+        ],
+        max_tool_calls=1,
+        max_llm_calls_per_turn=10,
+    )
+
+    result = await loop.run_turn(session.id, "尝试两次工具")
+
+    assert result.status == "ok"
+    assert result.reply == "基于已有结果收尾。"
+    assert result.stats["tool_calls"] == 1
+    assert any(step["type"] == "tool_limit" for step in result.steps)
+
+
+async def test_tool_limit_ignored_finalizes(tmp_path: Path) -> None:
+    """模型收到上限提示后仍继续要工具，则直接兜底结束。"""
+    loop, session, llm, trace, sessions = make_loop(
+        tmp_path,
+        [
+            '{"action": "todo", "input": {"action": "list"}}',
+            '{"action": "todo", "input": {"action": "list"}}',
+            '{"action": "todo", "input": {"action": "list"}}',
+        ],
+        max_tool_calls=1,
+        max_llm_calls_per_turn=10,
     )
 
     result = await loop.run_turn(session.id, "一直调用工具")
 
-    assert result.status == "max_steps"
-    assert "最大工具循环次数" in result.reply
-    assert result.stats["llm_calls"] == 2
-    assert result.stats["tool_calls"] == 2
-    assert len(result.steps) == 2
+    assert result.status == "max_tool_calls"
+    assert "最大工具调用次数" in result.reply
+    assert result.stats["tool_calls"] == 1
 
 
 async def test_max_llm_calls(tmp_path: Path) -> None:
@@ -317,7 +360,7 @@ async def test_max_llm_calls(tmp_path: Path) -> None:
     loop, session, llm, trace, sessions = make_loop(
         tmp_path,
         ['{"action": "todo", "input": {"action": "list"}}'],
-        max_tool_steps=10,
+        max_tool_calls=10,
         max_llm_calls_per_turn=1,
     )
 
@@ -384,7 +427,7 @@ async def test_compression_integration(tmp_path: Path) -> None:
     loop, session, llm, trace, sessions = make_loop(
         tmp_path,
         ["压缩摘要", '{"final": "新回答"}'],
-        context_token_budget=1,
+        max_history_messages=1,
         keep_recent_messages=1,
     )
 
@@ -424,6 +467,24 @@ async def test_compression_integration(tmp_path: Path) -> None:
 
     events = trace.read_events(session.id)
     assert any(event["event"] == "compress" for event in events)
+
+
+async def test_context_overflow_returns_readable_reply(
+    tmp_path: Path,
+) -> None:
+    """System + 当前轮超预算时不调用 LLM，直接返回明确提示。"""
+    loop, session, llm, trace, sessions = make_loop(
+        tmp_path,
+        [],
+        context_token_budget=1,
+    )
+
+    result = await loop.run_turn(session.id, "这条消息本身就很长")
+
+    assert result.status == "context_overflow"
+    assert "输入过长" in result.reply
+    assert llm.calls == []
+    assert sessions.get(session.id).messages[-1].kind == "final"
 
 
 async def test_empty_input_raises(tmp_path: Path) -> None:

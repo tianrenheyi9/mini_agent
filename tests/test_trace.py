@@ -304,6 +304,21 @@ def test_invalid_session_id_is_rejected(
         logger.log_turn_start(session_id=session_id, turn_id="u_1")
 
 
+def test_write_failure_is_isolated(tmp_path: Path) -> None:
+    """
+    Trace 写盘失败不能影响业务。
+
+    这里把目标文件路径做成目录，open("a") 会抛 OSError；
+    断言 log 方法不向上抛异常，读取则返回空列表。
+    """
+    logger = make_logger(tmp_path)
+    (tmp_path / "traces" / "s_test.jsonl").mkdir()
+
+    logger.log_turn_start(session_id="s_test", turn_id="u_1")
+
+    assert logger.read_events("s_test") == []
+
+
 def test_unicode_is_preserved(tmp_path: Path) -> None:
     """Trace 中的中文不转义，方便直接阅读。"""
     logger = make_logger(tmp_path)

@@ -6,7 +6,9 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.agent.context import ContextManager
+import pytest
+
+from app.agent.context import ContextBudgetExceeded, ContextManager
 from app.agent.llm import LLMError
 from app.config import Settings, get_settings
 from app.session.models import Session, TurnStats
@@ -172,8 +174,35 @@ def test_build_extends_final_to_its_user_message() -> None:
     assert contents[:2] == ["第二个问题", "第二个回答"]
 
 
-def test_build_trims_oldest_history_when_over_budget() -> None:
-    """预算极小时，保留 System + 当前轮，删掉全部历史。"""
+def test_build_trims_by_complete_turn() -> None:
+    """硬截断按完整轮次删除，不能留下没有 user 的 final。"""
+    base = make_context(
+        FakeLLM([]),
+        context_token_budget=100000,
+        keep_recent_messages=10,
+    )
+    session = make_session()
+
+    full = base.build(session, turn_id="u_3", tools=TOOLS)
+    # full = [system, 第一轮 user, 第一轮 final, 第二轮 user, 第二轮 final, 当前 user]
+    one_turn = [full[0], full[3], full[4], full[5]]
+    budget = base.estimate_tokens(one_turn)
+
+    context = make_context(
+        FakeLLM([]),
+        context_token_budget=budget,
+        keep_recent_messages=10,
+    )
+    trimmed = context.build(session, turn_id="u_3", tools=TOOLS)
+
+    contents = [message["content"] for message in trimmed[1:]]
+    assert contents == ["第二个问题", "第二个回答", "当前问题"]
+    # 历史窗口的第一条必须是 user，不能是孤立 final。
+    assert trimmed[1]["role"] == "user"
+
+
+def test_build_raises_when_current_turn_exceeds_budget() -> None:
+    """System + 当前轮本身就超预算时，明确抛错而不是假装成功。"""
     context = make_context(
         FakeLLM([]),
         context_token_budget=1,
@@ -181,10 +210,8 @@ def test_build_trims_oldest_history_when_over_budget() -> None:
     )
     session = make_session()
 
-    messages = context.build(session, turn_id="u_3", tools=TOOLS)
-    contents = [message["content"] for message in messages[1:]]
-
-    assert contents == ["当前问题"]
+    with pytest.raises(ContextBudgetExceeded):
+        context.build(session, turn_id="u_3", tools=TOOLS)
 
 
 def test_needs_compression_by_token_budget() -> None:
@@ -260,6 +287,8 @@ async def test_compress_updates_summary_cursor_and_stats() -> None:
     prompt = llm.calls[0][0]["content"]
     assert "旧摘要" in prompt
     assert "第一个问题" in prompt
+    # 摘要必须显式关闭 JSON Mode，否则会被 response_format 干扰。
+    assert llm.call_kwargs[0]["json_mode"] is False
 
 
 async def test_build_excludes_summarized_messages() -> None:

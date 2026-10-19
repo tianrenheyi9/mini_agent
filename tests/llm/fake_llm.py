@@ -25,6 +25,8 @@ class FakeLLM:
         self._responses = list(responses)
         # 记录每次调用收到的 messages，测试中可以断言“上下文里有什么”。
         self.calls: list[list[dict[str, Any]]] = []
+        # 记录每次调用的可选参数，便于断言 json_mode 等配置。
+        self.call_kwargs: list[dict[str, Any]] = []
 
     async def chat(
         self,
@@ -36,6 +38,13 @@ class FakeLLM:
     ) -> LLMResponse:
         # 深拷贝一份消息，避免后续代码修改列表影响测试记录。
         self.calls.append([dict(message) for message in messages])
+        self.call_kwargs.append(
+            {
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "json_mode": json_mode,
+            }
+        )
 
         if not self._responses:
             # 脚本用完了还继续调用，通常说明循环次数或测试预期写错了。

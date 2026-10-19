@@ -250,20 +250,27 @@ class TraceLogger:
         events: list[dict[str, Any]] = []
         # 逐行读取，而不是一次性 json.load：
         # JSONL 的每一行都是独立事件，损坏一行不影响其它行。
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        "Skip corrupt trace line in %s", session_id
-                    )
-                    continue
-                if isinstance(event, dict):
-                    events.append(event)
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            # Trace 是辅助数据：读不到就返回空列表，不影响主流程。
+            logger.exception("Failed to read trace for %s", session_id)
+            return []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Skip corrupt trace line in %s", session_id
+                )
+                continue
+            if isinstance(event, dict):
+                events.append(event)
 
         # 只返回最近的 limit 条，避免 API 一次返回整个文件。
         return events[-limit:]
@@ -290,11 +297,17 @@ class TraceLogger:
         }
         # separators 去掉多余空格，一行更紧凑；ensure_ascii=False 保留中文。
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(line + "\n")
-            # Trace 是“尽力而为”的可观测性数据：
-            # flush 保证进入操作系统缓冲区，但不做 fsync，避免拖慢主流程。
-            handle.flush()
+        try:
+            with path.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(line + "\n")
+                # Trace 是“尽力而为”的可观测性数据：
+                # flush 保证进入操作系统缓冲区，但不做 fsync，避免拖慢主流程。
+                handle.flush()
+        except OSError:
+            # 磁盘不可写、路径被占用等情况下，Trace 失败不能中断 Agent。
+            # 这里只记录错误，业务结果继续返回。
+            logger.exception("Failed to write trace for %s", session_id)
+            return
 
         logger.info(
             "trace session=%s turn=%s event=%s",

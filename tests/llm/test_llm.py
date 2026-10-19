@@ -120,26 +120,38 @@ def status_error(status_code: int, message: str = "boom") -> APIStatusError:
 
 
 async def test_client_is_created_with_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    """不注入 client 时，应按配置创建 AsyncOpenAI，并把超时和重试次数传进去。"""
+    """不注入 client 时按配置创建一次 AsyncOpenAI，并在 aclose 时关闭。"""
     captured: dict[str, Any] = {}
+    instances: list[Any] = []
 
     class FakeAsyncOpenAI:
         def __init__(self, **kwargs: Any) -> None:
             captured.update(kwargs)
-            self.chat = FakeChat([success_completion("ok")])
+            self.chat = FakeChat(
+                [success_completion("ok"), success_completion("ok")]
+            )
+            self.closed = False
+            instances.append(self)
+
+        async def close(self) -> None:
+            self.closed = True
 
     # 替换模块里的 AsyncOpenAI，避免真的创建网络客户端。
     monkeypatch.setattr(llm_module, "AsyncOpenAI", FakeAsyncOpenAI)
 
-    result = await LLMClient(make_settings()).chat(
-        [{"role": "user", "content": "hi"}]
-    )
+    client = LLMClient(make_settings())
+    await client.chat([{"role": "user", "content": "one"}])
+    await client.chat([{"role": "user", "content": "two"}])
 
     assert captured["api_key"] == "test-key"
     assert captured["base_url"] == BASE_URL
     assert captured["timeout"] == 5.0
     assert captured["max_retries"] == 2
-    assert result.content == "ok"
+    # 两次 chat 复用同一个客户端，而不是每次新建。
+    assert len(instances) == 1
+
+    await client.aclose()
+    assert instances[0].closed is True
 
 
 async def test_per_call_parameters_override_defaults() -> None:

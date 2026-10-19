@@ -32,7 +32,11 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from app.agent.context import CompressionResult, ContextManager
+from app.agent.context import (
+    CompressionResult,
+    ContextBudgetExceeded,
+    ContextManager,
+)
 from app.agent.llm import LLMClient, LLMConfigError, LLMError
 from app.agent.parser import FinalAnswer, ParseError, ToolCall, parse
 from app.agent.prompt import build_repair_message
@@ -63,7 +67,8 @@ class TurnResult:
     thought: str
     steps: list[dict[str, Any]]
     stats: dict[str, int]
-    status: str  # ok / max_steps / max_llm_calls / parse_error / llm_error
+    status: str
+    # ok / max_tool_calls / max_llm_calls / parse_error / llm_error / context_overflow
     compression: dict[str, Any] | None = None
 
 
@@ -95,6 +100,20 @@ class AgentLoop:
         """当前时间，用于 System Prompt 和 ToolContext。"""
         return self._clock()
 
+    @property
+    def sessions(self) -> SessionManager:
+        """API 层通过它做会话 CRUD，保证和 Loop 使用同一个实例。"""
+        return self._sessions
+
+    @property
+    def trace(self) -> TraceLogger:
+        """API 层通过它读取 Trace。"""
+        return self._trace
+
+    async def aclose(self) -> None:
+        """关闭底层 LLM 客户端；供 FastAPI lifespan 调用。"""
+        await self._llm.aclose()
+
     def _now_iso(self) -> str:
         """当前时间的 ISO 字符串，用于消息时间戳。"""
         return now_iso(self._clock())
@@ -115,6 +134,7 @@ class AgentLoop:
         steps: list[dict[str, Any]] = []
         started = time.perf_counter()
         repairs = 0
+        tool_limit_notified = False
         compression: CompressionResult | None = None
 
         # 同一会话的轮次串行执行；不同会话互不阻塞。
@@ -152,7 +172,9 @@ class AgentLoop:
                 )
 
             # ---------- 2. 主循环 ----------
-            for step in range(self._settings.max_tool_steps):
+            # 循环上限是“总 LLM 调用次数”，不是工具次数。
+            # 工具次数由 turn_stats.tool_calls 单独限制。
+            for step in range(self._settings.max_llm_calls_per_turn):
                 # 第二道预算：协议纠错和工具步骤都会消耗 LLM 调用。
                 if (
                     turn_stats.llm_calls
@@ -170,12 +192,28 @@ class AgentLoop:
                         compression=compression,
                     )
 
-                messages = self._context.build(
-                    session,
-                    turn_id=turn_id,
-                    tools=self._registry.tools(),
-                    now=self._now(),
-                )
+                # build() 在“System + 当前轮”已经超出预算时会抛出异常。
+                # 这是明确的可恢复错误：不要继续请求一个注定超限的 Prompt。
+                try:
+                    messages = self._context.build(
+                        session,
+                        turn_id=turn_id,
+                        tools=self._registry.tools(),
+                        now=self._now(),
+                    )
+                except ContextBudgetExceeded:
+                    return self._finish(
+                        session=session,
+                        turn_id=turn_id,
+                        reply="当前输入过长，请缩短后重试。",
+                        thought="",
+                        steps=steps,
+                        turn_stats=turn_stats,
+                        started=started,
+                        status="context_overflow",
+                        compression=compression,
+                    )
+
                 prompt_tokens_est = self._context.estimate_tokens(messages)
 
                 # 先计数再调用：失败的调用也占用了预算和一次尝试机会。
@@ -283,6 +321,46 @@ class AgentLoop:
                 # 分支 C：调用工具。
                 # 类型上走到这里只剩 ToolCall。
                 tool_call: ToolCall = parsed
+
+                # 工具次数是独立预算：超过上限后不再执行，
+                # 而是给模型一次“基于已有信息收尾”的机会。
+                if turn_stats.tool_calls >= self._settings.max_tool_calls:
+                    if tool_limit_notified:
+                        # 已经提醒过一次仍然继续要工具，直接兜底结束。
+                        return self._finish(
+                            session=session,
+                            turn_id=turn_id,
+                            reply=(
+                                "已达到单轮最大工具调用次数"
+                                f"（{self._settings.max_tool_calls}），"
+                                "先给你阶段性结果。"
+                            ),
+                            thought="",
+                            steps=steps,
+                            turn_stats=turn_stats,
+                            started=started,
+                            status="max_tool_calls",
+                            compression=compression,
+                        )
+
+                    tool_limit_notified = True
+                    steps.append(
+                        {
+                            "type": "tool_limit",
+                            "step": step,
+                            "limit": self._settings.max_tool_calls,
+                        }
+                    )
+                    session.append_user(
+                        "工具调用次数已达上限"
+                        f"（{self._settings.max_tool_calls} 次）。"
+                        "请不要再调用工具，直接基于已有信息输出 final。",
+                        turn_id,
+                        created_at=self._now_iso(),
+                        kind="repair",
+                    )
+                    continue
+
                 session.append_assistant_tool_call(
                     thought=tool_call.thought,
                     action=tool_call.action,
@@ -340,20 +418,38 @@ class AgentLoop:
                     result=result,
                 )
 
-            # ---------- 3. 达到工具循环上限 ----------
+                # 工具结果可能很长；执行后再次检查旧历史是否需要压缩。
+                # 当前轮本身不会被摘要，避免丢掉正在推理的 observation。
+                try:
+                    mid_compression = await self._context.maybe_compress(
+                        session,
+                        turn_id=turn_id,
+                        tools=self._registry.tools(),
+                        turn_stats=turn_stats,
+                        now=self._now(),
+                    )
+                except Exception:
+                    logger.exception("Mid-turn compression failed; continuing")
+                    mid_compression = None
+
+                if mid_compression is not None and mid_compression.compressed:
+                    compression = mid_compression
+                    self._trace.log_compression(
+                        session_id=session.id,
+                        turn_id=turn_id,
+                        result=mid_compression,
+                    )
+
+            # ---------- 3. 达到 LLM 调用上限 ----------
             return self._finish(
                 session=session,
                 turn_id=turn_id,
-                reply=(
-                    "已达到单轮最大工具循环次数"
-                    f"（{self._settings.max_tool_steps}），"
-                    "先给你阶段性结果。"
-                ),
+                reply="本轮 LLM 调用次数已达上限，先给你阶段性结果。",
                 thought="",
                 steps=steps,
                 turn_stats=turn_stats,
                 started=started,
-                status="max_steps",
+                status="max_llm_calls",
                 compression=compression,
             )
 

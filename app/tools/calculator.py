@@ -13,6 +13,7 @@ calculator 工具：安全地计算算术表达式。
 from __future__ import annotations
 
 import ast
+import asyncio
 import math
 from typing import Any
 
@@ -22,6 +23,8 @@ from app.tools.base import ToolContext, ToolExecutionError, ToolSpec
 MAX_EXPRESSION_LENGTH = 200
 MAX_EXPONENT = 100
 MAX_INTEGER_BITS = 10_000
+MAX_AST_NODES = 200
+MAX_AST_DEPTH = 50
 
 
 def build_calculator_tool() -> ToolSpec:
@@ -54,7 +57,9 @@ async def _calculator_handler(
 ) -> dict[str, Any]:
     """工具入口：取出表达式，调用安全计算函数，返回结构化结果。"""
     expression = input_data["expression"]
-    result = evaluate_expression(expression)
+    # 放到工作线程执行：纯 CPU 计算不会阻塞事件循环，
+    # Registry 的 wait_for 也能真正让出控制权。
+    result = await asyncio.to_thread(evaluate_expression, expression)
     return {
         "expression": expression.strip(),
         "result": result,
@@ -82,8 +87,16 @@ def evaluate_expression(expression: str) -> int | float:
     except (SyntaxError, ValueError) as exc:
         raise ToolExecutionError("表达式语法错误") from exc
 
+    # 表达式长度已经限制了规模，这里再做一次节点数量检查，
+    # 防止未来放宽长度限制后出现超深/超大 AST。
+    node_count = sum(1 for _ in ast.walk(tree))
+    if node_count > MAX_AST_NODES:
+        raise ToolExecutionError(
+            f"表达式过于复杂（最多 {MAX_AST_NODES} 个节点）"
+        )
+
     try:
-        result = _eval_node(tree.body)
+        result = _eval_node(tree.body, depth=0)
     except ZeroDivisionError as exc:
         # 1 / 0、1 // 0、1 % 0 都会走到这里。
         raise ToolExecutionError("不能除以 0") from exc
@@ -109,7 +122,7 @@ def evaluate_expression(expression: str) -> int | float:
     return result
 
 
-def _eval_node(node: ast.AST) -> int | float:
+def _eval_node(node: ast.AST, depth: int = 0) -> int | float:
     """
     递归计算 AST 节点。
 
@@ -117,6 +130,9 @@ def _eval_node(node: ast.AST) -> int | float:
     BinOp(1, Add, BinOp(2, Mult, 3))。
     我们只放行白名单中的节点类型，其余全部报错。
     """
+    # 递归深度保护：正常表达式远达不到这个层级。
+    if depth > MAX_AST_DEPTH:
+        raise ToolExecutionError("表达式嵌套过深")
 
     # 数字常量。注意 bool 是 int 的子类，要单独排除。
     if isinstance(node, ast.Constant):
@@ -127,7 +143,7 @@ def _eval_node(node: ast.AST) -> int | float:
     # 正负号，例如 -5、+3。
     # 先递归计算操作数，再套用符号。
     if isinstance(node, ast.UnaryOp):
-        operand = _eval_node(node.operand)
+        operand = _eval_node(node.operand, depth + 1)
         if isinstance(node.op, ast.UAdd):
             return +operand
         if isinstance(node.op, ast.USub):
@@ -137,8 +153,8 @@ def _eval_node(node: ast.AST) -> int | float:
     # 二元运算，例如 1 + 2、2 ** 10。
     # 先递归计算左右子树，再按运算符计算。
     if isinstance(node, ast.BinOp):
-        left = _eval_node(node.left)
-        right = _eval_node(node.right)
+        left = _eval_node(node.left, depth + 1)
+        right = _eval_node(node.right, depth + 1)
 
         if isinstance(node.op, ast.Add):
             return left + right
@@ -158,6 +174,17 @@ def _eval_node(node: ast.AST) -> int | float:
                 raise ToolExecutionError(
                     f"指数绝对值不能超过 {MAX_EXPONENT}"
                 )
+            # 关键：在真正计算前预估结果位宽。
+            # 例如 (2**100)**100 = 2**10000，约 10100 bit，
+            # 应该在分配大整数之前就拒绝，而不是算完再检查。
+            if (
+                isinstance(left, int)
+                and isinstance(right, int)
+                and right > 0
+            ):
+                estimated_bits = max(1, abs(left).bit_length()) * right
+                if estimated_bits > MAX_INTEGER_BITS:
+                    raise ToolExecutionError("计算结果过大")
             return left**right
 
         raise ToolExecutionError("不支持的二元运算符")

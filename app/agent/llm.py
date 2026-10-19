@@ -87,7 +87,27 @@ class LLMClient:
         client: AsyncOpenAI | None = None,
     ) -> None:
         self._settings = settings
+        # 允许外部注入客户端（测试/共享连接池）；
+        # 只有内部创建的客户端才由本对象负责关闭。
         self._client = client
+        self._owns_client = client is None
+
+    def _get_client(self) -> AsyncOpenAI:
+        """
+        懒加载并复用 SDK 客户端。
+
+        复用客户端可以共享底层 httpx 连接池，
+        避免每次 chat() 都重新建立连接。
+        """
+        if self._client is None:
+            self._client = self._create_client()
+        return self._client
+
+    async def aclose(self) -> None:
+        """关闭内部持有的客户端；注入的客户端由调用方负责关闭。"""
+        if self._client is not None and self._owns_client:
+            await self._client.close()
+            self._client = None
 
     def _create_client(self) -> AsyncOpenAI:
         """用当前配置创建真实的 SDK 客户端。"""
@@ -126,7 +146,7 @@ class LLMClient:
                 "LLM is not configured: set LLM_BASE_URL, LLM_API_KEY and LLM_MODEL"
             )
 
-        client = self._client or self._create_client()
+        client = self._get_client()
         started = time.perf_counter()
 
         # 第 2 步：组装请求参数。
