@@ -540,6 +540,100 @@ async def test_large_tool_output_is_compacted(tmp_path: Path) -> None:
     assert "已截断" in observation or "已省略" in observation
 
 
+async def test_pure_chat_follow_up(tmp_path: Path) -> None:
+    """纯对话追问：最近历史必须进入下一次 Prompt。"""
+    loop, session, llm, trace, sessions = make_loop(
+        tmp_path,
+        ['{"final": "上海今天小雨，22~28℃。"}'],
+    )
+
+    async with sessions.locked(session.id) as stored:
+        stored.append_user("北京天气怎么样？", "u_prev")
+        stored.append_assistant_final(
+            thought="",
+            final="北京今天多云，18~26℃。",
+            turn_id="u_prev",
+        )
+
+    result = await loop.run_turn(session.id, "那上海呢？")
+
+    assert result.status == "ok"
+    contents = [message["content"] for message in llm.calls[0]]
+    assert any("北京天气怎么样" in content for content in contents)
+    assert any("北京今天多云" in content for content in contents)
+    assert any("那上海呢" in content for content in contents)
+
+
+async def test_tool_follow_up(tmp_path: Path) -> None:
+    """带工具追问：系统 Prompt 的待办快照让模型能引用上一条待办 id。"""
+    loop, session, llm, trace, sessions = make_loop(
+        tmp_path,
+        [
+            '{"action": "todo", "input": {"action": "complete", "id": "t_1"}}',
+            '{"final": "已经标记完成。"}',
+        ],
+    )
+
+    async with sessions.locked(session.id) as stored:
+        stored.append_user("记一条待办：周五前提交周报", "u_prev")
+        stored.append_assistant_final(
+            thought="",
+            final="已记录。",
+            turn_id="u_prev",
+        )
+        stored.todos.append(
+            {
+                "id": "t_1",
+                "content": "周五前提交周报",
+                "done": False,
+                "created_at": FIXED_NOW.isoformat(),
+            }
+        )
+
+    result = await loop.run_turn(session.id, "把刚才那条标记完成")
+
+    assert result.status == "ok"
+    assert result.steps[0]["tool"] == "todo"
+    assert result.steps[0]["input"]["id"] == "t_1"
+    assert result.steps[0]["status"] == "ok"
+
+    system_prompt = llm.calls[0][0]["content"]
+    assert "t_1" in system_prompt
+    assert "周五前提交周报" in system_prompt
+
+    reloaded = sessions.get(session.id)
+    assert reloaded.todos[0]["done"] is True
+
+
+async def test_turn_stats(tmp_path: Path) -> None:
+    """分类统计写入 TurnResult，并累计到 Session。"""
+    loop, session, llm, trace, sessions = make_loop(
+        tmp_path,
+        [
+            CALCULATOR_CALL,
+            '{"final": "2 的 10 次方是 1024。"}',
+        ],
+    )
+
+    result = await loop.run_turn(session.id, "2 的 10 次方")
+
+    assert result.stats["llm_calls"] == 2
+    assert result.stats["tool_calls"] == 1
+    assert result.stats["compression_calls"] == 0
+    assert set(result.stats) == {
+        "llm_calls",
+        "tool_calls",
+        "compression_calls",
+        "prompt_tokens",
+        "completion_tokens",
+        "compression_prompt_tokens",
+        "compression_completion_tokens",
+    }
+
+    reloaded = sessions.get(session.id)
+    assert reloaded.stats.to_dict() == result.stats
+
+
 async def test_empty_input_raises(tmp_path: Path) -> None:
     """空消息在进入循环前就被拒绝。"""
     loop, session, llm, trace, sessions = make_loop(tmp_path, [])

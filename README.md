@@ -8,9 +8,10 @@
 - 工具协议：自定义 JSON 协议，由自研解析器提取 `thought / action / final`
 - 会话：Web 端左侧 Session 列表，多个浏览器窗口可分别绑定不同 Session，互不影响
 - 存储：文件系统 JSON（会话）+ JSONL（Trace），无需数据库
-- 测试：pytest（单元 / 集成 / 真实 LLM 冒烟）
+- 测试：pytest（单元 / 集成 / 真实 LLM + Agent 联调）
 
-> 代码仓库：`<GitHub 链接待填>`
+> 代码仓库：<https://github.com/tianrenheyi9/mini_agent>
+> AI Prompt 与问题解决记录：[`AI_LOG.md`](./AI_LOG.md)
 
 ---
 
@@ -251,35 +252,40 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
 
 | ID | 验收项 | 预期结果 | 验证方式 |
 | --- | --- | --- | --- |
-| AC-01 | 直接回复 | 无需工具的问题直接返回 `final` | `test_loop.py::test_direct_answer` |
-| AC-02 | 单工具调用 | 调用 `calculator` 后基于结果回复 | `test_loop.py::test_single_tool` |
-| AC-03 | 多工具串联 | 一轮内 `weather` → `todo(add)` → 汇总 | `test_loop.py::test_multi_step_chain` |
-| AC-04 | 工具注册与 Schema | 注册表含 4 个工具；缺失必填/类型错误被拒绝 | `test_tools.py` |
-| AC-05 | todo 持久化 | 新增/完成/删除/列表跨轮、跨请求生效 | `test_tools.py::test_todo_lifecycle` |
-| AC-06 | 会话隔离 | A/B 交错发消息，待办与历史互不污染 | `test_sessions.py::test_session_isolation` |
-| AC-07 | 会话恢复 | 重新从磁盘加载后历史完整，可继续对话 | `test_sessions.py::test_reload_from_disk` |
-| AC-08 | 纯对话追问 | 多轮指代（“那上海呢”）能利用历史 | `test_loop.py::test_pure_chat_follow_up` |
-| AC-09 | 带工具追问 | 追问触发正确工具且参数来自上下文 | `test_loop.py::test_tool_follow_up` |
-| AC-10 | 工具次数上限 | 执行 `MAX_TOOL_CALLS` 次后仍保留一次 final 机会；模型无视提示再次要工具才兜底 | `test_loop.py::test_tool_limit_keeps_final_chance` / `test_tool_limit_ignored_finalizes` |
-| AC-11 | 上下文压缩 | 超预算触发摘要；最近窗口保留；关键事实不丢 | `test_context.py::test_compression_triggered` |
-| AC-12 | 压缩兜底 | 摘要 LLM 失败时硬截断且不中断对话 | `test_context.py::test_summary_failure_fallback` |
-| AC-13 | 解析容错 | 代码围栏、前后缀文本、嵌套大括号、非法 JSON | `test_parser.py` |
-| AC-14 | 未知工具自纠正 | 回填可用工具列表，模型下一轮改正 | `test_loop.py::test_unknown_tool_self_correct` |
-| AC-15 | 工具异常 | 异常转为 observation，不出 500，trace 留存堆栈 | `test_loop.py::test_tool_exception` |
-| AC-16 | LLM 异常 | 超时/5xx 重试后返回可读错误 | `test_loop.py::test_llm_retry_then_fail` |
-| AC-17 | Trace | LLM 调用与工具调用均落 JSONL，含耗时与状态 | `test_trace.py` |
-| AC-18 | API 契约 | 创建/列表/详情/发消息/404 | `test_api.py` |
-| AC-19 | 真实 LLM | 通过 AgentLoop 完成一次工具调用并最终回答 | `test_live_agent.py`（`-m live`） |
-| AC-20 | 双窗口演示 | 按 1.5 步骤手动复验 | 手工 |
-| AC-21 | 工具结果回填格式 | 不使用缺少 `tool_call_id` 的 `role="tool"`；assistant 原始协议 + user observation | `test_loop.py::test_observation_message_format` |
-| AC-22 | 压缩游标 | 第二次压缩只处理游标之后的新消息，不重复摘要 | `test_context.py::test_compression_cursor_advances` |
-| AC-23 | 分类统计 | LLM 调用、工具调用、压缩次数与 token 分别统计 | `test_loop.py::test_turn_stats` |
-| AC-24 | Calculator 资源上限 | 嵌套乘方在执行前按预估位宽拒绝 | `test_calculator.py::test_nested_power_rejected_before_computation` |
-| AC-25 | 上下文硬边界 | System + 当前轮超预算时明确返回 `context_overflow`，不调用 LLM | `test_context.py::test_build_raises_when_current_turn_exceeds_budget` |
-| AC-26 | 轮次级硬截断 | 从最旧历史开始按完整轮次删除，不破坏 User/Final 配对 | `test_context.py::test_build_trims_by_complete_turn` |
-| AC-27 | Trace 故障隔离 | Trace 写盘/读取失败只记日志，不影响 Agent 回复 | `test_trace.py::test_write_failure_is_isolated` |
-| AC-28 | 客户端复用与 JSON Mode | LLM 客户端复用并在 shutdown 关闭；摘要显式关闭 JSON Mode | `test_llm.py::test_client_is_created_with_settings` / `test_context.py::test_compress_updates_summary_cursor_and_stats` |
-| AC-29 | 当前轮 observation 预算 | 长工具结果先分级截断/省略，不因工具输出让用户收到“输入过长” | `test_context.py::test_current_turn_observations_are_compacted` / `test_loop.py::test_large_tool_output_is_compacted` |
+| AC-01 | 直接回复 | 无需工具的问题直接返回 `final` | `tests/agent/test_loop.py::test_direct_answer` |
+| AC-02 | 单工具调用 | 调用 `calculator` 后基于结果回复，并使用 user observation 回填 | `tests/agent/test_loop.py::test_single_tool_and_observation_format` |
+| AC-03 | 多工具串联 | 一轮内 `weather` → `todo(add)` → 汇总 | `tests/agent/test_loop.py::test_multi_step_tool_chain` |
+| AC-04 | 工具注册与 Schema | 注册表含 4 个工具；缺失必填/类型错误被拒绝 | `tests/tools/test_schema.py` / `test_registry.py` |
+| AC-05 | todo 持久化 | 新增/完成/删除/列表跨轮、跨请求生效 | `tests/tools/test_todo.py` |
+| AC-06 | 会话隔离 | A/B 交错发消息，待办与历史互不污染 | `tests/session/test_manager.py::test_sessions_are_isolated` |
+| AC-07 | 会话恢复 | 重新从磁盘加载后历史完整，可继续对话 | `tests/session/test_manager.py::test_locked_persists_changes` / `test_store.py::test_save_and_load_roundtrip` |
+| AC-08 | 纯对话追问 | 多轮指代（“那上海呢”）能利用历史 | `tests/agent/test_loop.py::test_pure_chat_follow_up` |
+| AC-09 | 带工具追问 | 追问触发正确工具且参数来自待办快照 | `tests/agent/test_loop.py::test_tool_follow_up` |
+| AC-10 | 工具次数上限 | 执行 `MAX_TOOL_CALLS` 次后仍保留一次 final 机会；模型无视提示再次要工具才兜底 | `tests/agent/test_loop.py::test_tool_limit_keeps_final_chance` / `test_tool_limit_ignored_finalizes` |
+| AC-11 | 上下文压缩 | 超预算触发摘要；最近窗口保留；游标推进 | `tests/agent/test_context.py::test_compress_updates_summary_cursor_and_stats` |
+| AC-12 | 压缩兜底 | 摘要 LLM 失败时降级且不中断对话 | `tests/agent/test_context.py::test_compress_falls_back_when_summary_llm_fails` |
+| AC-13 | 解析容错 | 代码围栏、前后缀文本、嵌套大括号、非法 JSON | `tests/agent/test_parser.py` |
+| AC-14 | 未知工具自纠正 | 回填可用工具列表，模型下一轮改正 | `tests/agent/test_loop.py::test_unknown_tool_self_correct` |
+| AC-15 | 工具异常 | 业务异常转为 observation，不中断本轮 | `tests/agent/test_loop.py::test_tool_error_continues` |
+| AC-16 | LLM 异常 | 未配置/服务不可用返回可读提示，并写 final | `tests/agent/test_loop.py::test_llm_errors_produce_readable_reply` |
+| AC-17 | Trace | LLM/工具/压缩事件均落 JSONL，含耗时与状态 | `tests/test_trace.py` |
+| AC-18 | API 契约 | 创建/列表/详情/发消息/删除/Trace/404/422 | `tests/test_api.py` |
+| AC-19 | 真实 LLM | 通过 AgentLoop 调用 calculator 与 todo 并最终回答 | `tests/agent/test_live_agent.py`（`-m live`） |
+| AC-20 | 双窗口演示 | 浏览器中新建两个会话、交错对话、刷新恢复 | 手工，已按 4.8 节验证 |
+| AC-21 | 工具结果回填格式 | 不使用缺少 `tool_call_id` 的 `role="tool"`；assistant 原始协议 + user observation | `tests/agent/test_loop.py::test_single_tool_and_observation_format` |
+| AC-22 | 压缩游标 | 第二次压缩只处理游标之后的新消息，不重复摘要 | `tests/agent/test_context.py::test_second_compression_does_not_repeat_cursor` |
+| AC-23 | 分类统计 | LLM 调用、工具调用、压缩次数与 token 分别统计并累计 | `tests/agent/test_loop.py::test_turn_stats` |
+| AC-24 | Calculator 资源上限 | 嵌套乘方在执行前按预估位宽拒绝 | `tests/tools/test_calculator.py::test_nested_power_rejected_before_computation` |
+| AC-25 | 上下文硬边界 | System + 当前用户消息仍超预算时返回 `context_overflow` | `tests/agent/test_context.py::test_build_raises_when_current_turn_exceeds_budget` |
+| AC-26 | 轮次级硬截断 | 从最旧历史开始按完整轮次删除，不破坏 User/Final 配对 | `tests/agent/test_context.py::test_build_trims_by_complete_turn` |
+| AC-27 | Trace 故障隔离 | Trace 写盘/读取失败只记日志，不影响 Agent 回复 | `tests/test_trace.py::test_write_failure_is_isolated` |
+| AC-28 | 客户端复用与 JSON Mode | LLM 客户端复用并在 shutdown 关闭；摘要显式关闭 JSON Mode | `tests/llm/test_llm.py::test_client_is_created_with_settings` / `tests/agent/test_context.py::test_compress_updates_summary_cursor_and_stats` |
+| AC-29 | 当前轮 observation 预算 | 长工具结果先分级截断/省略，不因工具输出让用户收到“输入过长” | `tests/agent/test_context.py::test_current_turn_observations_are_compacted` / `tests/agent/test_loop.py::test_large_tool_output_is_compacted` |
+
+> **2026-10-19 验收结果**：AC-01~AC-29 全部通过。
+> - 自动化：`pytest -q` → **199 passed, 2 deselected**
+> - 真实模型：`pytest -m live -q` → **2 passed**
+> - AC-20 已在浏览器中实际验证：calculator + todo、工具时间线、刷新恢复、双会话隔离。
 
 ---
 
@@ -1037,6 +1043,6 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 
 - [x] 源码（自研 Agent Runtime，无 Agent 框架依赖）
 - [x] `README.md`：运行方式、系统设计、Memory 召回时机与放置方式
-- [ ] `AI_LOG.md`：AI Prompt 与问题解决记录
-- [ ] 测试用例与运行结果
-- [ ] GitHub 仓库链接
+- [x] `AI_LOG.md`：AI Prompt 与问题解决记录
+- [x] 测试用例与运行结果：`pytest -q` → 199 passed；`pytest -m live -q` → 2 passed；浏览器端到端已复验
+- [x] GitHub 仓库链接：<https://github.com/tianrenheyi9/mini_agent>
