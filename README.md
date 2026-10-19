@@ -59,8 +59,9 @@ LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_API_KEY=sk-xxxxxxxxxxxxxxxx
 LLM_MODEL=deepseek-chat
 
-# 可选：访问境外 API 时配置本地代理，例如 http://127.0.0.1:7897
-LLM_PROXY=
+# 可选：访问境外 API 时设置标准代理环境变量
+# OpenAI SDK 底层的 httpx 会自动读取 HTTPS_PROXY
+# HTTPS_PROXY=http://127.0.0.1:7897
 
 # Agent 运行参数
 LLM_TIMEOUT_SECONDS=60
@@ -157,7 +158,7 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 | --- | --- | --- |
 | 语言 | Python 3.11 | Agent 逻辑短、可读性高；pytest 测试生态成熟 |
 | Web | FastAPI + uvicorn | 自带 Pydantic 校验与 OpenAPI；静态文件托管足够本项目 UI |
-| LLM 客户端 | `openai` SDK（`AsyncOpenAI`） | 官方 SDK 负责请求构造与响应类型解析；`base_url` 兼容任意 Provider，重试与错误映射自行实现 |
+| LLM 客户端 | `openai` SDK（`AsyncOpenAI`） | 官方 SDK 负责请求构造、响应类型解析、超时与重试；`base_url` 兼容任意 Provider，错误映射自行实现 |
 | 前端 | 原生 HTML/CSS/JS | 免构建、免 Node 环境，面试官 `pip install` 即可跑 |
 | 存储 | 每会话一个 JSON + Trace JSONL | 零依赖、可读、易调试；单机 MVP 足够 |
 | Schema 校验 | 自研 JSON Schema 子集校验 | 只支持 `type/required/enum/properties/items`，足以覆盖工具参数，避免过度设计 |
@@ -180,7 +181,7 @@ pytest -q -m live         # 真实 LLM 冒烟测试（需要 .env 配置）
 │  │  ├─ parser.py            # 输出协议解析器
 │  │  ├─ prompt.py            # System Prompt / 协议说明 / 工具目录渲染
 │  │  ├─ context.py           # 上下文构建、token 估算、压缩
-│  │  └─ llm.py               # OpenAI 兼容客户端、重试与超时
+│  │  └─ llm.py               # OpenAI SDK 客户端、异常映射与超时
 │  ├─ tools/
 │  │  ├─ base.py              # ToolSpec / 参数校验 / 执行结果
 │  │  ├─ registry.py          # 工具注册表
@@ -585,7 +586,7 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 
 | 场景 | 处理 | 用户感知 |
 | --- | --- | --- |
-| LLM 网络错误 / 超时 / 5xx | 指数退避重试 2 次（0.5s、1.5s），仍失败则中止本轮 | “模型服务暂时不可用，请稍后重试。” |
+| LLM 网络错误 / 超时 / 5xx / 429 | 由 OpenAI SDK 自动指数退避重试（`max_retries=2`），仍失败则中止本轮 | “模型服务暂时不可用，请稍后重试。” |
 | LLM 4xx（鉴权/参数） | 不重试，记录错误码 | “模型配置有误：<原因>” |
 | 输出不是合法 JSON | 回填协议纠错消息，最多 2 次 | 正常回复或格式异常提示 |
 | `action` 与 `final` 同时/都缺失 | 视为协议错误，同上 | 同上 |

@@ -67,7 +67,6 @@ class Settings:
     llm_base_url: str
     llm_api_key: str
     llm_model: str
-    llm_proxy: str
     llm_timeout_seconds: float
     tool_timeout_seconds: float
     max_tool_steps: int
@@ -105,7 +104,6 @@ def get_settings() -> Settings:
         llm_base_url=_env_str("LLM_BASE_URL"),
         llm_api_key=_env_str("LLM_API_KEY"),
         llm_model=_env_str("LLM_MODEL"),
-        llm_proxy=_env_str("LLM_PROXY"),
         llm_timeout_seconds=_env_float("LLM_TIMEOUT_SECONDS", 60.0),
         tool_timeout_seconds=_env_float("TOOL_TIMEOUT_SECONDS", 10.0),
         max_tool_steps=_env_int("MAX_TOOL_STEPS", 8),
