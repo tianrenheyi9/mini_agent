@@ -28,6 +28,10 @@ from app.session.models import Session
 logger = logging.getLogger(__name__)
 
 # 会话 id 只允许安全字符，防止通过 ../ 构造任意文件路径。
+# 规则：
+# - 必须以 s_ 开头；
+# - 后面只允许字母、数字、下划线、连字符；
+# - 总长度限制在 66 个字符以内。
 _SESSION_ID_RE = re.compile(r"^s_[A-Za-z0-9_-]{1,64}$")
 
 
@@ -36,13 +40,14 @@ class SessionStoreError(Exception):
 
 
 class SessionNotFound(SessionStoreError):
-    """请求的会话不存在。"""
+    """请求的会话不存在（管理器层会抛它）。"""
 
 
 class SessionStore:
     """负责 Session 的 JSON 落盘与读取。"""
 
     def __init__(self, sessions_dir: Path) -> None:
+        # 目录不存在时自动创建，调用方不需要先 mkdir。
         self._dir = Path(sessions_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
 
@@ -52,7 +57,11 @@ class SessionStore:
         return bool(_SESSION_ID_RE.fullmatch(session_id))
 
     def path_for(self, session_id: str) -> Path:
-        """把会话 id 映射成文件路径。"""
+        """
+        把会话 id 映射成文件路径。
+
+        先校验 id，再拼接路径，避免 ../../etc/passwd 这类路径穿越。
+        """
         if not self.is_valid_id(session_id):
             raise ValueError(f"非法的会话 id：{session_id!r}")
         return self._dir / f"{session_id}.json"
@@ -61,11 +70,20 @@ class SessionStore:
         return self.path_for(session_id).exists()
 
     def save(self, session: Session) -> None:
-        """原子写入会话文件。"""
+        """
+        原子写入会话文件。
+
+        步骤：
+        1. 先把 Session 序列化成 JSON 字符串；
+        2. 在目标目录创建临时文件；
+        3. 写入、flush、fsync；
+        4. 用 os.replace 原子替换目标文件；
+        5. 任一步失败都清理临时文件。
+        """
         target = self.path_for(session.id)
         payload = json.dumps(
             session.to_dict(),
-            ensure_ascii=False,
+            ensure_ascii=False,  # 中文保持可读，不转成 \uXXXX
             indent=2,
         )
 
@@ -92,7 +110,14 @@ class SessionStore:
             raise
 
     def load(self, session_id: str) -> Session | None:
-        """读取会话；文件不存在返回 None，文件损坏则抛 SessionStoreError。"""
+        """
+        读取会话。
+
+        三种结果：
+        - 文件不存在：返回 None（调用方可决定是否报 404）；
+        - 文件损坏：抛 SessionStoreError；
+        - 正常：返回 Session。
+        """
         path = self.path_for(session_id)
         if not path.exists():
             return None
@@ -127,7 +152,11 @@ class SessionStore:
             return False
 
     def list_ids(self) -> list[str]:
-        """列出所有会话 id。"""
+        """
+        列出所有会话 id。
+
+        glob 只匹配 s_*.json，因此不会把临时文件或其它文件算进来。
+        """
         return sorted(
             path.stem
             for path in self._dir.glob("s_*.json")
@@ -158,6 +187,7 @@ class SessionStore:
                     "created_at": session.created_at,
                     "updated_at": session.updated_at,
                     "message_count": len(session.messages),
+                    # 列表只展示未完成待办数量，计算成本很低。
                     "todo_open_count": sum(
                         1 for todo in session.todos if not todo.get("done")
                     ),

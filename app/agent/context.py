@@ -46,12 +46,12 @@ _CJK_RE = re.compile(
 class CompressionResult:
     """一次压缩调用的结果，供 Trace、UI 和测试使用。"""
 
-    compressed: bool
-    summarized_messages: int = 0
-    summary_until_msg_id: str | None = None
-    before_tokens: int = 0
-    after_tokens: int = 0
-    fallback: bool = False
+    compressed: bool  # 是否真的执行了压缩
+    summarized_messages: int = 0  # 本次合并了多少条消息
+    summary_until_msg_id: str | None = None  # 压缩后的游标
+    before_tokens: int = 0  # 压缩前估算 token
+    after_tokens: int = 0  # 压缩后估算 token
+    fallback: bool = False  # 是否走了“摘要失败”的降级路径
 
 
 class ContextManager:
@@ -125,6 +125,8 @@ class ContextManager:
         这只影响本次 Prompt，不修改 Session 中的消息。
         """
         current_time = now or self._clock()
+
+        # 1. System Prompt：协议、工具目录、摘要、待办、时间。
         system_prompt = build_system_prompt(
             tools,
             summary=session.summary,
@@ -132,7 +134,12 @@ class ContextManager:
             now=current_time,
         )
 
+        # 2. 最近 K 条已完成对话（只含 user / final）。
         history = self._recent_history(session, turn_id)
+
+        # 3. 当前轮的全部消息：
+        #    用户输入、工具调用、observation、协议纠错都要保留，
+        #    否则模型无法完成多步工具串联。
         current_turn = [
             message
             for message in session.messages
@@ -145,6 +152,7 @@ class ContextManager:
         messages.extend(message.to_llm_message() for message in history)
         messages.extend(message.to_llm_message() for message in current_turn)
 
+        # 4. 最后一道保险：仍然超预算就从最旧历史开始删。
         if trim:
             messages = self._trim_history_to_budget(
                 messages,
@@ -167,8 +175,10 @@ class ContextManager:
         """
         keep = max(0, self._settings.keep_recent_messages)
         if keep == 0:
+            # 配置为 0 表示不保留任何历史，只发送当前轮。
             return []
 
+        # 先从“游标之后”取，避免已压缩的消息重新进入窗口。
         visible = [
             message
             for message in session.messages_after_cursor()
@@ -176,6 +186,8 @@ class ContextManager:
         ]
         recent = visible[-keep:]
 
+        # 如果切片刚好从 final 开始，它对应的 user 问题会被截掉。
+        # 这里把前一条补回来，保持问答成对。
         if recent and recent[0].kind == "final":
             index = next(
                 (
@@ -206,6 +218,8 @@ class ContextManager:
             and self.estimate_tokens(messages)
             > self._settings.context_token_budget
         ):
+            # messages[0] 是 System，永远保留；
+            # messages[1] 是当前最旧的历史消息。
             del messages[1]
             history_count -= 1
         return messages
@@ -219,6 +233,7 @@ class ContextManager:
         now: datetime | None = None,
     ) -> bool:
         """判断是否需要压缩：token 超预算，或未压缩消息条数超上限。"""
+        # 用 trim=False 估算真实压力，避免硬截断把“需要压缩”的信号藏起来。
         messages = self.build(
             session,
             turn_id=turn_id,
@@ -229,6 +244,7 @@ class ContextManager:
         if self.estimate_tokens(messages) > self._settings.context_token_budget:
             return True
 
+        # 条数上限只看“可压缩的旧消息”，最近窗口本身是有界的。
         uncompressed = self._compression_candidates(session, turn_id)
         return len(uncompressed) > self._settings.max_history_messages
 
@@ -246,6 +262,8 @@ class ContextManager:
         now: datetime | None = None,
     ) -> CompressionResult:
         """需要时才压缩；否则返回 compressed=False。"""
+        # 决策（needs_compression）和执行（compress）分开：
+        # 循环可以在需要时调用，测试也能单独测其中一半。
         if not self.needs_compression(
             session,
             turn_id=turn_id,
@@ -283,7 +301,10 @@ class ContextManager:
         ):
             return CompressionResult(compressed=False)
 
+        # 第 1 步：找出本次真正要合并的旧消息。
         candidates = self._compression_candidates(session, turn_id)
+
+        # 记录压缩前的估算值，方便 Trace 对比效果。
         before_tokens = self.estimate_tokens(
             self.build(
                 session,
@@ -302,10 +323,12 @@ class ContextManager:
                 after_tokens=before_tokens,
             )
 
+        # 第 2 步：把候选消息格式化成紧凑文本，并拼出摘要 Prompt。
         formatted = self._format_for_summary(candidates)
         prompt = self._summary_prompt(session.summary, formatted)
         fallback = False
 
+        # 第 3 步：调用 LLM 生成新摘要。
         try:
             response = await self._llm.chat(
                 [{"role": "user", "content": prompt}],
@@ -324,6 +347,7 @@ class ContextManager:
                 else self.estimate_text_tokens(summary)
             )
         except LLMError as exc:
+            # 摘要失败不能影响主对话：降级为本地拼接的兜底摘要。
             logger.warning("Summary LLM failed, using fallback: %s", exc)
             summary = self._fallback_summary(session.summary, candidates)
             fallback = True
@@ -331,6 +355,7 @@ class ContextManager:
                 prompt
             )
 
+        # 第 4 步：截断到配置上限，写回摘要并推进游标。
         summary = _truncate(summary, self._settings.summary_max_chars)
         session.summary = summary
         session.mark_summarized_until(
@@ -339,6 +364,7 @@ class ContextManager:
         )
         turn_stats.compression_calls += 1
 
+        # 第 5 步：重新估算压缩后的 Prompt，记录效果。
         after_tokens = self.estimate_tokens(
             self.build(
                 session,
@@ -372,11 +398,15 @@ class ContextManager:
         - 不属于当前轮。
         """
         recent = self._recent_history(session, turn_id)
+        # 用 turn_id 判断边界，而不是 msg_id：
+        # 同一轮里可能还有 tool_call / observation 等不可见消息，
+        # 它们也应该和这一轮一起被保留，不进入本次摘要。
         recent_turn_ids = {message.turn_id for message in recent}
 
         candidates: list[Message] = []
         for message in session.messages_after_cursor():
             if message.turn_id == turn_id:
+                # 当前轮正在执行，绝对不能摘要。
                 continue
             # 遇到最近窗口所属的轮次就停止：
             # 这些轮次整体保留，不进入摘要。
@@ -390,6 +420,8 @@ class ContextManager:
         """把消息压缩成适合放进摘要 Prompt 的紧凑文本。"""
         lines: list[str] = []
         for message in messages:
+            # 只保留对“长期事实”有价值的内容；
+            # 原始 JSON 和超长工具输出会做截断。
             if message.kind == "user":
                 lines.append(f"用户：{message.content}")
             elif message.kind == "final":
@@ -412,7 +444,12 @@ class ContextManager:
         return "\n".join(lines)
 
     def _summary_prompt(self, old_summary: str, formatted: str) -> str:
-        """构造摘要 Prompt；摘要只输出正文，不再套 JSON。"""
+        """
+        构造摘要 Prompt。
+
+        摘要是“记忆压缩”，不是对话，所以这里要求模型只输出正文，
+        不走 JSON 协议，避免多一层解析失败风险。
+        """
         return f"""你是一个对话摘要器。请把下面的对话压缩成不超过 {self._settings.summary_max_chars} 字的中文摘要。
 
 必须保留：
@@ -439,8 +476,10 @@ class ContextManager:
         """摘要 LLM 失败时，用旧摘要 + 最后两条可见消息兜底。"""
         lines: list[str] = []
         if old_summary.strip():
+            # 旧摘要已经包含更早的历史，必须保留。
             lines.append(f"旧摘要：{old_summary.strip()}")
 
+        # 取最后两条 user/final，尽量保留最近事实。
         anchors = [
             message for message in messages if message.visible_in_history
         ][-2:]

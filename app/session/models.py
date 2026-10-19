@@ -37,11 +37,16 @@ def now_iso(now: datetime | None = None) -> str:
 class TurnStats:
     """单轮对话的统计，避免和 Session 的累计值混在一起。"""
 
+    # 主循环里的 LLM 调用次数；协议纠错也计入这里。
     llm_calls: int = 0
+    # 工具执行次数。
     tool_calls: int = 0
+    # 压缩 LLM 调用次数，与主循环分开统计。
     compression_calls: int = 0
+    # 主循环 LLM 返回的 token 用量。
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # 压缩调用自身的 token 用量，单独统计便于成本分析。
     compression_prompt_tokens: int = 0
     compression_completion_tokens: int = 0
 
@@ -77,9 +82,16 @@ class TurnStats:
 
 @dataclass
 class SessionStats(TurnStats):
-    """Session 生命周期内的累计统计。"""
+    """
+    Session 生命周期内的累计统计。
+
+    继承 TurnStats 的字段，额外提供 add_turn()：
+    每轮结束时把该轮的统计加进来。
+    """
 
     def add_turn(self, turn: TurnStats) -> None:
+        # 这里逐个字段相加，而不是直接替换：
+        # Session 统计要跨多轮累计。
         self.llm_calls += turn.llm_calls
         self.tool_calls += turn.tool_calls
         self.compression_calls += turn.compression_calls
@@ -93,28 +105,39 @@ class SessionStats(TurnStats):
 class Message:
     """一条会话消息。"""
 
-    msg_id: str
-    role: str  # user / assistant
-    kind: str  # user / final / tool_call / tool_observation / repair / raw
-    content: str
-    turn_id: str
-    created_at: str
-    thought: str = ""
-    tool: str | None = None
-    tool_input: dict[str, Any] | None = None
-    status: str | None = None
-    meta: dict[str, Any] = field(default_factory=dict)
+    msg_id: str  # 形如 m_1、m_2，由 Session.append_message 分配
+    role: str  # OpenAI 消息角色：user / assistant
+    kind: str  # 业务类型：user / final / tool_call / tool_observation / repair / raw
+    content: str  # 对该角色而言要展示/发送的文本
+    turn_id: str  # 同一次用户输入产生的消息共享一个 turn_id
+    created_at: str  # ISO 时间
+    thought: str = ""  # 模型思考过程，只用于 UI / Trace，不进入历史上下文
+    tool: str | None = None  # 工具名，tool_call / tool_observation 使用
+    tool_input: dict[str, Any] | None = None  # 解析后的工具参数
+    status: str | None = None  # 工具执行状态：ok / error
+    meta: dict[str, Any] = field(default_factory=dict)  # 预留扩展字段
 
     @property
     def visible_in_history(self) -> bool:
-        """是否应该出现在后续轮次的历史窗口中。"""
+        """
+        是否应该出现在后续轮次的历史窗口中。
+
+        只有 user 原话和 final 回答需要长期保留；
+        thought、工具原始结果等只对当前轮有用。
+        """
         return self.kind in HISTORY_KINDS
 
     def to_llm_message(self) -> dict[str, str]:
-        """转换成 OpenAI messages 数组中的一项。"""
+        """
+        转换成 OpenAI messages 数组中的一项。
+
+        注意：这里只输出 role + content。
+        工具 observation 的 role 是 user，而不是缺少 tool_call_id 的 tool。
+        """
         return {"role": self.role, "content": self.content}
 
     def to_dict(self) -> dict[str, Any]:
+        # 必填字段总是写入；可选字段为空时省略，保持 JSON 简洁。
         data: dict[str, Any] = {
             "msg_id": self.msg_id,
             "role": self.role,
@@ -137,6 +160,8 @@ class Message:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Message":
+        # 对缺失字段给出安全默认值：
+        # 旧版本数据或手工编辑过的文件也能尽量加载，而不是直接崩溃。
         return cls(
             msg_id=str(data.get("msg_id", "")),
             role=str(data.get("role", "user")),
@@ -156,15 +181,15 @@ class Message:
 class Session:
     """一个独立会话。"""
 
-    id: str
-    title: str = DEFAULT_TITLE
+    id: str  # s_ + uuid，文件名也使用它
+    title: str = DEFAULT_TITLE  # 首条用户消息自动生成
     created_at: str = ""
     updated_at: str = ""
-    summary: str = ""
-    summary_until_msg_id: str | None = None
+    summary: str = ""  # 压缩后的长期记忆
+    summary_until_msg_id: str | None = None  # 压缩游标：摘要覆盖到的最后一条消息
     todos: list[dict[str, Any]] = field(default_factory=list)
     messages: list[Message] = field(default_factory=list)
-    next_msg_seq: int = 1
+    next_msg_seq: int = 1  # 下一个 msg_id 序号，落盘保存避免重启后回退
     stats: SessionStats = field(default_factory=SessionStats)
 
     def append_message(
@@ -186,10 +211,13 @@ class Session:
 
         msg_id 不复用，保证压缩游标不会指错消息。
         """
+        # 没传时间就用当前时间；Session 的创建时间只在第一条消息时补。
         timestamp = created_at or now_iso()
         if not self.created_at:
             self.created_at = timestamp
 
+        # 先分配 msg_id，再自增序号：
+        # 这样即使中途异常，也不会把同一个 id 分配给两条消息。
         message = Message(
             msg_id=f"m_{self.next_msg_seq}",
             role=role,
@@ -222,6 +250,7 @@ class Session:
         created_at: str | None = None,
         kind: str = "user",
     ) -> Message:
+        """追加用户消息；kind 可传 repair 来表示协议纠错提示。"""
         return self.append_message(
             role="user",
             kind=kind,
@@ -301,6 +330,7 @@ class Session:
         turn_id: str,
         created_at: str | None = None,
     ) -> Message:
+        """保存最终回答；这是历史窗口会保留的两类消息之一。"""
         return self.append_message(
             role="assistant",
             kind="final",
@@ -316,7 +346,12 @@ class Session:
         *,
         updated_at: str | None = None,
     ) -> None:
-        """推进摘要游标；游标只能指向真实存在的消息。"""
+        """
+        推进摘要游标；游标只能指向真实存在的消息。
+
+        游标之前 = 已由 summary 覆盖；
+        游标之后 = 还需要原文或后续压缩。
+        """
         if self.message_index(msg_id) is None:
             raise ValueError(f"消息不存在：{msg_id!r}")
         self.summary_until_msg_id = msg_id
@@ -330,7 +365,12 @@ class Session:
         return None
 
     def messages_after_cursor(self) -> list[Message]:
-        """返回摘要游标之后的所有消息。"""
+        """
+        返回摘要游标之后的所有消息。
+
+        游标为空或指向的消息找不到时，保守地返回全部消息：
+        宁可多给模型一些上下文，也不要在数据异常时静默丢历史。
+        """
         if self.summary_until_msg_id is None:
             return list(self.messages)
         index = self.message_index(self.summary_until_msg_id)
@@ -339,6 +379,7 @@ class Session:
         return self.messages[index + 1 :]
 
     def to_dict(self) -> dict[str, Any]:
+        """转换成可 JSON 序列化的字典。"""
         return {
             "id": self.id,
             "title": self.title,
@@ -354,6 +395,12 @@ class Session:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Session":
+        """
+        从磁盘/旧版本数据恢复 Session。
+
+        对缺失或类型不对的字段尽量降级处理，
+        只有真正无法继续的损坏才由 SessionStore 报错。
+        """
         messages = [
             Message.from_dict(item)
             for item in data.get("messages", [])
@@ -397,4 +444,5 @@ def _next_seq_from_messages(messages: list[Message]) -> int:
 
 
 def _int(value: Any) -> int:
+    """只接受真正的整数；bool 和字符串都退化为 0。"""
     return value if isinstance(value, int) and not isinstance(value, bool) else 0

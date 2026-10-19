@@ -41,6 +41,9 @@ class SessionManager:
         traces_dir: Path | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        # 所有依赖都允许注入：
+        # - 生产环境用默认值；
+        # - 测试可以传临时目录、固定时钟和独立的 Store。
         self._settings = settings or get_settings()
         self._store = store or SessionStore(self._settings.sessions_dir)
         self._traces_dir = Path(traces_dir or self._settings.traces_dir)
@@ -49,12 +52,15 @@ class SessionManager:
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _now(self) -> str:
+        """当前时间的 ISO 字符串；走注入的 clock，便于测试。"""
         return now_iso(self._clock())
 
     def create(self, title: str | None = None) -> Session:
         """创建一个新会话并立即落盘。"""
         timestamp = self._now()
         session = Session(
+            # uuid4().hex 生成 32 位十六进制，碰撞概率极低；
+            # 加上 s_ 前缀也满足 SessionStore 的安全 id 规则。
             id=f"s_{uuid4().hex}",
             title=(title or "").strip() or DEFAULT_TITLE,
             created_at=timestamp,
@@ -84,6 +90,7 @@ class SessionManager:
 
         asyncio.Lock 是协程安全的：
         在同一个事件循环里，setdefault 之间没有 await，不会产生竞态。
+        每个会话一把锁，因此不同会话可以并行。
         """
         return self._locks.setdefault(session_id, asyncio.Lock())
 
@@ -99,6 +106,8 @@ class SessionManager:
         """
         lock = self.lock_for(session_id)
         async with lock:
+            # 进入临界区后再读文件：
+            # 这样拿到的一定是上一个请求保存后的最新状态。
             session = self._store.load(session_id)
             if session is None:
                 raise SessionNotFound(f"会话不存在：{session_id}")
@@ -106,16 +115,19 @@ class SessionManager:
                 yield session
             finally:
                 # 即使本轮中途出错，也保存已经发生的用户消息和待办变化。
+                # finally 保证锁释放前完成落盘。
                 self._store.save(session)
 
     async def delete(self, session_id: str) -> bool:
         """删除会话文件与 Trace 文件。"""
         lock = self.lock_for(session_id)
         async with lock:
+            # 删除也走同一把锁，避免与正在运行的轮次互相踩踏。
             deleted = self._store.delete(session_id)
             self._locks.pop(session_id, None)
 
             if deleted:
+                # Trace 文件可能不存在（还没发生过 LLM 调用），忽略即可。
                 trace_path = self._traces_dir / f"{session_id}.jsonl"
                 try:
                     trace_path.unlink()
