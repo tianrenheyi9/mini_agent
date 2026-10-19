@@ -42,6 +42,8 @@ class TurnStats:
     compression_calls: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    compression_prompt_tokens: int = 0
+    compression_completion_tokens: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -50,6 +52,8 @@ class TurnStats:
             "compression_calls": self.compression_calls,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "compression_prompt_tokens": self.compression_prompt_tokens,
+            "compression_completion_tokens": self.compression_completion_tokens,
         }
 
     @classmethod
@@ -62,6 +66,12 @@ class TurnStats:
             compression_calls=_int(data.get("compression_calls")),
             prompt_tokens=_int(data.get("prompt_tokens")),
             completion_tokens=_int(data.get("completion_tokens")),
+            compression_prompt_tokens=_int(
+                data.get("compression_prompt_tokens")
+            ),
+            compression_completion_tokens=_int(
+                data.get("compression_completion_tokens")
+            ),
         )
 
 
@@ -75,6 +85,8 @@ class SessionStats(TurnStats):
         self.compression_calls += turn.compression_calls
         self.prompt_tokens += turn.prompt_tokens
         self.completion_tokens += turn.completion_tokens
+        self.compression_prompt_tokens += turn.compression_prompt_tokens
+        self.compression_completion_tokens += turn.compression_completion_tokens
 
 
 @dataclass

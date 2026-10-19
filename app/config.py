@@ -122,6 +122,8 @@ class Settings:
     max_compression_calls_per_turn: int
     max_parse_repairs: int
     context_token_budget: int
+    token_safety_factor: float
+    summary_max_tokens: int
     max_history_messages: int
     keep_recent_messages: int
     summary_max_chars: int
@@ -167,6 +169,8 @@ def get_settings() -> Settings:
         ),
         max_parse_repairs=_env_int("MAX_PARSE_REPAIRS", 2),
         context_token_budget=_env_int("CONTEXT_TOKEN_BUDGET", 6000),
+        token_safety_factor=_env_float("TOKEN_SAFETY_FACTOR", 1.2),
+        summary_max_tokens=_env_int("SUMMARY_MAX_TOKENS", 512),
         max_history_messages=_env_int("MAX_HISTORY_MESSAGES", 40),
         keep_recent_messages=_env_int("KEEP_RECENT_MESSAGES", 8),
         summary_max_chars=_env_int("SUMMARY_MAX_CHARS", 800),

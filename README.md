@@ -77,6 +77,8 @@ MAX_LLM_CALLS_PER_TURN=10     # 单轮 LLM 调用上限（含协议纠错）
 MAX_COMPRESSION_CALLS_PER_TURN=1  # 单轮压缩调用上限
 MAX_PARSE_REPAIRS=2           # 单轮协议纠错最多重试几次
 CONTEXT_TOKEN_BUDGET=6000     # 估算 token 超过该值时触发压缩
+TOKEN_SAFETY_FACTOR=1.2       # 估算值 × 安全系数，吸收 tokenizer 偏差
+SUMMARY_MAX_TOKENS=512        # 摘要调用自身的输出上限
 MAX_HISTORY_MESSAGES=40       # 未压缩历史的消息条数硬上限
 KEEP_RECENT_MESSAGES=8        # 压缩后保留的最近消息条数
 SUMMARY_MAX_CHARS=800         # 会话摘要最大字符数
@@ -560,7 +562,9 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
     "tool_calls": 2,
     "compression_calls": 1,
     "prompt_tokens": 1832,
-    "completion_tokens": 210
+    "completion_tokens": 210,
+    "compression_prompt_tokens": 620,
+    "compression_completion_tokens": 120
   },
   "todos": [
     { "id": "t_1", "content": "给妈妈买生日礼物", "done": false, "created_at": "..." }
@@ -705,10 +709,12 @@ messages = [
 token 估算采用中英文加权：
 
 ```text
-estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条消息固定开销 4
+raw = 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条消息固定开销 4
+estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 ```
 
-估算只用于触发阈值，实际精度不影响正确性；README 明确标注其为近似值。
+`TOKEN_SAFETY_FACTOR`（默认 1.2）用于吸收不同厂商 tokenizer 的偏差。
+估算只用于触发阈值，实际精度不影响正确性；API 返回的 `usage.prompt_tokens` 会用于统计对账。
 
 ### 6.2 压缩算法（基础版）
 
@@ -902,10 +908,13 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 **Context**
 - 未超预算不压缩；
 - 超预算触发摘要，摘要进入 System Prompt，最近 K 条原文保留；
+- `build()` 只把 user / final 放入历史窗口，历史 thought 与工具结果不进入上下文；
+- 最近窗口从 final 开始时，自动补回配对的 user 消息；
+- 仍然超预算时，从最旧历史消息开始硬截断，System 与当前轮保留；
 - **游标只前进**：第二次压缩不会重复摘要 `summary_until_msg_id` 之前的消息；
 - 摘要合并旧摘要（增量）；
 - 摘要失败降级截断；
-- 历史工具结果不进入后续上下文（断言 prompt 中不含旧 observation）。
+- 压缩单独累计 `compression_calls` 与压缩 token。
 
 **API**
 - 创建/列表/详情/删除；
@@ -938,7 +947,7 @@ estimate_tokens(text) ≈ 中文字符数 × 1.0 + 其他字符数 ÷ 4 + 每条
 | 存储 | JSON 文件 | 零依赖、可读；不适合大规模并发/多实例，后续可换 SQLite/Postgres |
 | 记忆 | 仅会话内 | 题目要求窗口隔离；跨会话检索会引入隐私与串扰问题，列为扩展 |
 | 压缩 | 单层增量摘要 | 满足“基础压缩”；不做向量召回与摘要树 |
-| token 估算 | 字符加权 | 免依赖 tiktoken；预算留白吸收误差 |
+| token 估算 | 字符加权 + 20% 安全系数 | 免依赖 tiktoken；跨 Provider 更稳，usage.prompt_tokens 用于对账 |
 | 认证 | 无登录 | 单机演示；生产需加用户体系与 Session 归属校验 |
 | 工具 mock | search / weather 固定数据 | 保证测试确定性；真实接入只需替换 handler |
 

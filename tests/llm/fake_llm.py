@@ -30,7 +30,9 @@ class FakeLLM:
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool | None = None,
     ) -> LLMResponse:
         # 深拷贝一份消息，避免后续代码修改列表影响测试记录。
         self.calls.append([dict(message) for message in messages])
