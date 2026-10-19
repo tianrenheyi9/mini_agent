@@ -214,6 +214,68 @@ def test_build_raises_when_current_turn_exceeds_budget() -> None:
         context.build(session, turn_id="u_3", tools=TOOLS)
 
 
+def test_current_turn_observations_are_compacted() -> None:
+    """当前轮工具结果过长时，先压缩旧 observation，而不是直接报错。"""
+    base = make_context(
+        FakeLLM([]),
+        context_token_budget=100000,
+        keep_recent_messages=0,
+        observation_prompt_chars=200,
+    )
+    session = Session(id="s_big", created_at=T0, updated_at=T0)
+    turn = "u_big"
+    session.append_user("简短问题", turn, created_at=T0)
+    session.append_assistant_tool_call(
+        thought="",
+        action="search",
+        tool_input={"query": "x"},
+        raw_content='{"action":"search"}',
+        turn_id=turn,
+        created_at=T0,
+    )
+    session.append_tool_observation(
+        tool="search",
+        status="ok",
+        content="[工具执行结果]\ntool: search\nstatus: ok\nresult: " + "A" * 2000,
+        turn_id=turn,
+        created_at=T0,
+    )
+    session.append_assistant_tool_call(
+        thought="",
+        action="search",
+        tool_input={"query": "x"},
+        raw_content='{"action":"search"}',
+        turn_id=turn,
+        created_at=T0,
+    )
+    session.append_tool_observation(
+        tool="search",
+        status="ok",
+        content="[工具执行结果]\ntool: search\nstatus: ok\nresult: " + "B" * 2000,
+        turn_id=turn,
+        created_at=T0,
+    )
+
+    full = base.build(session, turn_id=turn, tools=TOOLS, trim=False)
+    # full = [system, user, tool_call1, obs1, tool_call2, obs2]
+    without_first_obs = [full[0], full[1], full[2], full[4], full[5]]
+    budget = base.estimate_tokens(without_first_obs) + 100
+
+    context = make_context(
+        FakeLLM([]),
+        context_token_budget=budget,
+        keep_recent_messages=0,
+        observation_prompt_chars=200,
+    )
+    messages = context.build(session, turn_id=turn, tools=TOOLS)
+    contents = [message["content"] for message in messages]
+
+    assert context.estimate_tokens(messages) <= budget
+    assert any("已截断" in content or "已省略" in content for content in contents)
+    # 最新的工具结果尽量保留完整。
+    assert any("B" * 100 in content for content in contents)
+
+
 def test_needs_compression_by_token_budget() -> None:
     """超过 token 预算时触发压缩。"""
     context = make_context(FakeLLM([]), context_token_budget=1)

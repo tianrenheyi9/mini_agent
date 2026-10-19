@@ -72,6 +72,8 @@ LLM_MAX_TOKENS=1024
 LLM_JSON_MODE=false
 
 TOOL_TIMEOUT_SECONDS=10       # 单个工具执行超时
+TOOL_OBSERVATION_MAX_CHARS=2000  # 单条 observation 落盘/初始上限
+OBSERVATION_PROMPT_CHARS=600  # 当前轮 observation 首次压缩目标
 MAX_TOOL_CALLS=8              # 单轮最多执行几次工具
 MAX_LLM_CALLS_PER_TURN=10     # 单轮 LLM 调用上限（含 final、纠错、额度提示）
 MAX_COMPRESSION_CALLS_PER_TURN=1  # 单轮压缩调用上限
@@ -277,6 +279,7 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
 | AC-26 | 轮次级硬截断 | 从最旧历史开始按完整轮次删除，不破坏 User/Final 配对 | `test_context.py::test_build_trims_by_complete_turn` |
 | AC-27 | Trace 故障隔离 | Trace 写盘/读取失败只记日志，不影响 Agent 回复 | `test_trace.py::test_write_failure_is_isolated` |
 | AC-28 | 客户端复用与 JSON Mode | LLM 客户端复用并在 shutdown 关闭；摘要显式关闭 JSON Mode | `test_llm.py::test_client_is_created_with_settings` / `test_context.py::test_compress_updates_summary_cursor_and_stats` |
+| AC-29 | 当前轮 observation 预算 | 长工具结果先分级截断/省略，不因工具输出让用户收到“输入过长” | `test_context.py::test_current_turn_observations_are_compacted` / `test_loop.py::test_large_tool_output_is_compacted` |
 
 ---
 
@@ -769,7 +772,8 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 - 摘要仍超长 → 按字符硬截断并加 `…`，保证 prompt 不超预算；
 - 压缩过程写 Trace（`event=compress`），记录压缩前后估算 token、淘汰条数；
 - **硬截断按完整轮次删除历史**，避免留下没有 user 的 final；
-- System + 当前轮本身就超预算 → 抛 `ContextBudgetExceeded`，Agent 返回 `context_overflow`，不发送注定超限的请求；
+- **当前轮 observation 分级压缩**：从最旧的工具结果开始，依次尝试 600/300/120/40 字符，保留 `tool/status` 头部；仍放不下则替换成“已省略”，最新结果尽量保留完整；
+- 只有 System + 当前用户消息本身仍超预算时，才抛 `ContextBudgetExceeded`，Agent 返回 `context_overflow`；
 - 每次工具执行后再次检查压缩，避免长工具结果把上下文撑大。
 
 ### 6.3 不做的复杂压缩
@@ -792,7 +796,7 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 | 工具超时 | 每个工具 10s 超时，视同执行失败 | 同上 |
 | 工具次数达到 `MAX_TOOL_CALLS` | 提示模型直接输出 final；仍继续要工具则终止循环 | 阶段性结果 |
 | LLM 调用达到 `MAX_LLM_CALLS_PER_TURN` | 终止循环，返回阶段性结果 | 明确告知调用上限 |
-| System + 当前轮超过上下文预算 | 返回 `context_overflow`，不调用 LLM | “当前输入过长，请缩短后重试。” |
+| System + 当前轮超过上下文预算 | 先分级压缩当前轮 observation；仍超限才返回 `context_overflow` | “本轮上下文超出预算（可能来自较长的工具结果），请重试或缩小任务范围。” |
 | Trace 写盘/读取失败 | 只记录日志，不中断 Agent | 正常回复 |
 | 协议纠错达到 `MAX_PARSE_REPAIRS` | 停止重试，返回格式异常提示 | “模型输出格式异常，请重试。” |
 | 压缩达到 `MAX_COMPRESSION_CALLS_PER_TURN` | 跳过后续压缩，降级为硬截断 | 对话继续 |
@@ -928,7 +932,7 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 - 工具抛异常 → observation 回填后继续循环；
 - 工具次数达到 `MAX_TOOL_CALLS` 后仍保留一次 final 机会；模型无视提示再次要工具才兜底；
 - 达到 `MAX_LLM_CALLS_PER_TURN` → 终止且回复完整；
-- 上下文超预算 → `context_overflow`，不调用 LLM；
+- 上下文超预算 → 先分级压缩当前轮 observation；仍超限才 `context_overflow`；
 - `TurnStats` 分别记录 llm_calls / tool_calls / compression_calls / tokens；
 - LLM 超时/5xx → SDK 重试 → 最终失败提示。
 
@@ -947,7 +951,8 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 - `build()` 只把 user / final 放入历史窗口，历史 thought 与工具结果不进入上下文；
 - 最近窗口从 final 开始时，自动补回配对的 user 消息；
 - **硬截断按完整轮次删除**，不破坏 User/Assistant 配对；
-- System + 当前轮本身超预算 → `ContextBudgetExceeded`；
+- **当前轮 observation 超长时先分级压缩**，保留 tool/status 头部，最新结果尽量完整；
+- 只有 System + 当前用户消息本身仍超预算，才抛 `ContextBudgetExceeded`；
 - **游标只前进**：第二次压缩不会重复摘要 `summary_until_msg_id` 之前的消息；
 - 摘要合并旧摘要（增量）；
 - 摘要失败降级截断；
@@ -985,7 +990,7 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 | 工具协议 | 自研 JSON 协议 | 满足“自行解析”要求、可移植；代价是比原生 tool calling 多一层纠错 |
 | 工具结果回填 | assistant 原始协议 + user observation | 不伪造 `tool_call_id`；代价是模型需要通过 `[工具执行结果]` 文本标记理解 observation |
 | 循环预算 | 工具次数、LLM 调用、压缩、纠错分别限制 | `MAX_TOOL_CALLS` 只管工具执行；`MAX_LLM_CALLS_PER_TURN` 含 final/纠错；代价是配置项更多 |
-| 上下文硬边界 | 历史按完整轮次删除；System+当前轮超限时明确报错 | 不破坏 User/Final 配对，也不假装预算成功；代价是超长输入会被拒绝 |
+| 上下文硬边界 | 历史按完整轮次删除；当前轮 observation 分级压缩 | 不破坏 User/Final 配对，也不把工具输出过长归咎于用户；代价是旧工具结果会被截断 |
 | Trace 故障 | 写盘/读取失败只记日志 | 可观测性数据不能影响业务；代价是 Trace 可能缺失 |
 | LLM 客户端 | 懒加载并复用，shutdown 时关闭 | 复用连接池；代价是需要显式生命周期管理 |
 | 压缩游标 | `summary_until_msg_id` 只前进 | 防止重复摘要和 token 浪费；代价是 Session 模型多一个字段 |

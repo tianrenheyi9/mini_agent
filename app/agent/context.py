@@ -163,22 +163,19 @@ class ContextManager:
         ]
 
         system_message = {"role": "system", "content": system_prompt}
-        current_messages = [
-            message.to_llm_message() for message in current_turn
-        ]
 
         if trim:
-            # 硬截断按“完整轮次”删除历史，避免留下只有 final 没有 user 的片段。
+            # 先按完整轮次删历史；仍超预算时再压缩当前轮的 observation。
             return self._trim_history_to_budget(
                 system_message,
                 history,
-                current_messages,
+                current_turn,
             )
 
         return (
             [system_message]
             + [message.to_llm_message() for message in history]
-            + current_messages
+            + [message.to_llm_message() for message in current_turn]
         )
 
     def _recent_history(
@@ -226,36 +223,44 @@ class ContextManager:
         self,
         system_message: dict[str, str],
         history: Sequence[Message],
-        current_messages: Sequence[dict[str, str]],
+        current_turn: Sequence[Message],
     ) -> list[dict[str, str]]:
         """
-        硬截断兜底：按完整轮次从最旧历史开始删。
+        两级兜底：
 
-        为什么按轮次而不是单条消息？
-        如果只删掉 User A、保留 Assistant A，
-        历史窗口会以一条没有问题的回答开头，模型很难理解。
+        1. 按完整轮次删除最旧历史，保持 User/Final 配对；
+        2. 仍然超预算时，压缩当前轮的工具 observation。
 
-        如果历史都删完了仍然超预算，说明 System + 当前轮本身过大，
-        此时抛 ContextBudgetExceeded，让上层给出明确提示。
+        只有 System + 当前用户消息本身仍然超预算时，才抛异常。
         """
         remaining = list(history)
+        current_messages = [
+            message.to_llm_message() for message in current_turn
+        ]
 
         def render() -> list[dict[str, str]]:
             return (
                 [system_message]
                 + [message.to_llm_message() for message in remaining]
-                + list(current_messages)
+                + current_messages
             )
 
+        # 第一级：删除最旧的一整轮。
         while (
             remaining
             and self.estimate_tokens(render())
             > self._settings.context_token_budget
         ):
-            # 删除最旧的一整轮：该 turn_id 下的所有可见消息一起删除。
             oldest_turn = remaining[0].turn_id
             while remaining and remaining[0].turn_id == oldest_turn:
                 remaining.pop(0)
+
+        # 第二级：压缩当前轮 observation，而不是让用户为工具输出背锅。
+        current_messages = self._compact_current_turn(
+            system_message,
+            remaining,
+            current_turn,
+        )
 
         messages = render()
         estimated = self.estimate_tokens(messages)
@@ -265,6 +270,91 @@ class ContextManager:
                 self._settings.context_token_budget,
             )
         return messages
+
+    def _compact_current_turn(
+        self,
+        system_message: dict[str, str],
+        history: Sequence[Message],
+        current_turn: Sequence[Message],
+    ) -> list[dict[str, str]]:
+        """
+        当前轮超预算时，优先压缩较旧的工具结果。
+
+        顺序：
+        1. 从最旧的 observation 开始，依次尝试 600/300/120/40 字符；
+        2. 仍放不下就替换成“已省略”；
+        3. 最后才压缩旧 tool_call 的原始 JSON。
+        最新一条 observation 尽量保留完整。
+        """
+        current_messages = [
+            message.to_llm_message() for message in current_turn
+        ]
+
+        def render() -> list[dict[str, str]]:
+            return (
+                [system_message]
+                + [message.to_llm_message() for message in history]
+                + current_messages
+            )
+
+        if (
+            self.estimate_tokens(render())
+            <= self._settings.context_token_budget
+        ):
+            return current_messages
+
+        limits = _dedupe_limits(
+            [
+                self._settings.observation_prompt_chars,
+                300,
+                120,
+                40,
+            ]
+        )
+
+        observation_indices = [
+            index
+            for index, message in enumerate(current_turn)
+            if message.kind == "tool_observation"
+        ]
+
+        for index in observation_indices:
+            original = current_messages[index]["content"]
+            for limit in limits:
+                current_messages[index]["content"] = _compact_observation(
+                    original,
+                    limit,
+                )
+                if (
+                    self.estimate_tokens(render())
+                    <= self._settings.context_token_budget
+                ):
+                    return current_messages
+
+            current_messages[index]["content"] = (
+                "（较早的工具结果已省略，避免上下文超限）"
+            )
+            if (
+                self.estimate_tokens(render())
+                <= self._settings.context_token_budget
+            ):
+                return current_messages
+
+        # 最后才压缩 tool_call 的原始 JSON。
+        for index, message in enumerate(current_turn):
+            if message.kind != "tool_call":
+                continue
+            current_messages[index]["content"] = _compact_text(
+                current_messages[index]["content"],
+                200,
+            )
+            if (
+                self.estimate_tokens(render())
+                <= self._settings.context_token_budget
+            ):
+                return current_messages
+
+        return current_messages
 
     def needs_compression(
         self,
@@ -532,6 +622,50 @@ class ContextManager:
             lines.append(f"{role}：{message.content}")
 
         return "\n".join(lines) or "（摘要失败，早期历史已截断）"
+
+
+def _dedupe_limits(values: Sequence[int]) -> list[int]:
+    """去重并保持从大到小的候选长度。"""
+    result: list[int] = []
+    for value in values:
+        if value > 0 and value not in result:
+            result.append(value)
+    return result
+
+
+def _compact_observation(text: str, limit: int) -> str:
+    """
+    压缩一条工具 observation，但保留 tool/status 头部。
+
+    头部保留后，模型仍然知道“哪个工具、成功还是失败”，
+    只是正文（result/error 的内容）被截断。
+    """
+    if len(text) <= limit:
+        return text
+
+    parts = text.split("\n", 3)
+    if (
+        len(parts) == 4
+        and parts[0].startswith("[工具执行结果]")
+        and parts[1].startswith("tool:")
+        and parts[2].startswith("status:")
+    ):
+        header = "\n".join(parts[:3])
+        body = parts[3]
+        suffix = "…（已截断）"
+        remaining = limit - len(header) - len(suffix) - 1
+        if remaining <= 0:
+            return _truncate(header, limit)
+        return f"{header}\n{body[:remaining]}{suffix}"
+
+    return _truncate(text, limit)
+
+
+def _compact_text(text: str, limit: int) -> str:
+    """通用文本压缩，用于旧的 tool_call 原始 JSON。"""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…（已截断）"
 
 
 def _truncate(text: str, limit: int) -> str:

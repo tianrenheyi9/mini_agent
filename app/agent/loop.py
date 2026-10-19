@@ -205,7 +205,10 @@ class AgentLoop:
                     return self._finish(
                         session=session,
                         turn_id=turn_id,
-                        reply="当前输入过长，请缩短后重试。",
+                        reply=(
+                            "本轮上下文超出预算（可能来自较长的工具结果），"
+                            "请重试或缩小任务范围。"
+                        ),
                         thought="",
                         steps=steps,
                         turn_stats=turn_stats,
@@ -387,6 +390,7 @@ class AgentLoop:
                     tool_call.action,
                     tool_call.input,
                     result,
+                    max_chars=self._settings.tool_observation_max_chars,
                 )
                 session.append_tool_observation(
                     tool=tool_call.action,

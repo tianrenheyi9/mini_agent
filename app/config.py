@@ -117,6 +117,8 @@ class Settings:
     llm_max_tokens: int | None
     llm_json_mode: bool
     tool_timeout_seconds: float
+    tool_observation_max_chars: int
+    observation_prompt_chars: int
     max_tool_calls: int
     max_llm_calls_per_turn: int
     max_compression_calls_per_turn: int
@@ -163,6 +165,10 @@ def get_settings() -> Settings:
         llm_max_tokens=_env_optional_int("LLM_MAX_TOKENS", 1024),
         llm_json_mode=_env_bool("LLM_JSON_MODE", False),
         tool_timeout_seconds=_env_float("TOOL_TIMEOUT_SECONDS", 10.0),
+        tool_observation_max_chars=_env_int(
+            "TOOL_OBSERVATION_MAX_CHARS", 2000
+        ),
+        observation_prompt_chars=_env_int("OBSERVATION_PROMPT_CHARS", 600),
         # MAX_TOOL_CALLS 是新名称；保留 MAX_TOOL_STEPS 作为旧配置的兼容别名。
         max_tool_calls=_env_int(
             "MAX_TOOL_CALLS",

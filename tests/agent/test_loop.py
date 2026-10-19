@@ -16,6 +16,8 @@ from app.config import Settings, get_settings
 from app.session.manager import SessionManager
 from app.session.store import SessionStore
 from app.tools import build_default_registry
+from app.tools.base import ToolSpec
+from app.tools.registry import ToolRegistry
 from app.trace import TraceLogger
 from tests.llm.fake_llm import FakeLLM
 
@@ -58,6 +60,8 @@ def make_settings(**overrides: Any) -> Settings:
 def make_loop(
     tmp_path: Path,
     responses: list[str | Exception],
+    *,
+    registry: ToolRegistry | None = None,
     **overrides: Any,
 ) -> tuple[AgentLoop, Any, FakeLLM, TraceLogger, SessionManager]:
     """
@@ -86,7 +90,8 @@ def make_loop(
     loop = AgentLoop(
         settings=settings,
         llm=llm,  # type: ignore[arg-type]
-        registry=build_default_registry(timeout_seconds=1.0),
+        registry=registry
+        or build_default_registry(timeout_seconds=1.0),
         sessions=sessions,
         context=context,
         trace=trace,
@@ -482,9 +487,57 @@ async def test_context_overflow_returns_readable_reply(
     result = await loop.run_turn(session.id, "这条消息本身就很长")
 
     assert result.status == "context_overflow"
-    assert "输入过长" in result.reply
+    assert "上下文超出预算" in result.reply
     assert llm.calls == []
     assert sessions.get(session.id).messages[-1].kind == "final"
+
+
+async def test_large_tool_output_is_compacted(tmp_path: Path) -> None:
+    """工具结果超长时压缩 observation，而不是中断当前任务。"""
+
+    async def big_handler(
+        input_data: dict[str, Any],
+        context: Any,
+    ) -> dict[str, Any]:
+        return {"text": "X" * 5000}
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="big",
+            description="返回大段文本",
+            parameters={"type": "object", "properties": {}},
+            handler=big_handler,
+        )
+    )
+
+    loop, session, llm, trace, sessions = make_loop(
+        tmp_path,
+        ['{"action": "big", "input": {}}', '{"final": "已完成"}'],
+        registry=registry,
+        context_token_budget=1600,
+        observation_prompt_chars=100,
+        keep_recent_messages=0,
+        tool_observation_max_chars=5000,
+    )
+
+    result = await loop.run_turn(session.id, "调用大工具")
+
+    assert result.status == "ok"
+    assert result.reply == "已完成"
+
+    # 第二次调用看到的 observation 应该已经被压缩。
+    observation = next(
+        message["content"]
+        for message in llm.calls[1]
+        if message["role"] == "user"
+        and (
+            "[工具执行结果]" in message["content"]
+            or "工具结果" in message["content"]
+        )
+    )
+    assert len(observation) < 1000
+    assert "已截断" in observation or "已省略" in observation
 
 
 async def test_empty_input_raises(tmp_path: Path) -> None:
