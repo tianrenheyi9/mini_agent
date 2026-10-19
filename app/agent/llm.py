@@ -103,7 +103,9 @@ class LLMClient:
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
-        temperature: float = 0.0,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool | None = None,
     ) -> LLMResponse:
         """
         发送一次对话请求并返回解析后的结果。
@@ -111,6 +113,11 @@ class LLMClient:
         `messages` 是 OpenAI 格式的消息列表，例如：
             [{"role": "system", "content": "..."},
              {"role": "user", "content": "..."}]
+
+        三个可选参数都遵循同一规则：
+        - 传具体值：覆盖全局配置；
+        - 传 None（默认）：使用 Settings 中的默认值；
+        - Settings 中为空：不向模型发送该参数（兼容不支持某些参数的模型）。
         """
 
         # 第 1 步：检查必填配置。缺少配置时直接报错，不发无意义的网络请求。
@@ -122,15 +129,38 @@ class LLMClient:
         client = self._client or self._create_client()
         started = time.perf_counter()
 
-        # 第 2 步：调用 OpenAI SDK。
+        # 第 2 步：组装请求参数。
+        # 只在有值时才加入字典，避免把 None 传给某些严格的兼容服务。
+        request: dict[str, Any] = {
+            "model": self._settings.llm_model,
+            "messages": list(messages),
+            "stream": False,
+        }
+
+        effective_temperature = (
+            temperature
+            if temperature is not None
+            else self._settings.llm_temperature
+        )
+        if effective_temperature is not None:
+            request["temperature"] = effective_temperature
+
+        effective_max_tokens = (
+            max_tokens if max_tokens is not None else self._settings.llm_max_tokens
+        )
+        if effective_max_tokens is not None:
+            request["max_tokens"] = effective_max_tokens
+
+        effective_json_mode = (
+            json_mode if json_mode is not None else self._settings.llm_json_mode
+        )
+        if effective_json_mode:
+            request["response_format"] = {"type": "json_object"}
+
+        # 第 3 步：调用 OpenAI SDK。
         # base_url 指向任意兼容服务，SDK 会自动拼出 /chat/completions。
         try:
-            completion = await client.chat.completions.create(
-                model=self._settings.llm_model,
-                messages=list(messages),
-                temperature=temperature,
-                stream=False,
-            )
+            completion = await client.chat.completions.create(**request)
         except APIConnectionError as exc:
             # 网络层错误，包括连接失败和超时（APITimeoutError 是它的子类）。
             logger.warning("LLM connection error: %s", type(exc).__name__)
@@ -155,7 +185,7 @@ class LLMClient:
             logger.warning("LLM returned a non-JSON body")
             raise LLMResponseError("LLM returned a non-JSON body") from exc
 
-        # 第 3 步：请求成功，把 SDK 对象转换成项目自己的 LLMResponse。
+        # 第 4 步：请求成功，把 SDK 对象转换成项目自己的 LLMResponse。
         return self._parse_completion(completion, started)
 
     def _parse_completion(

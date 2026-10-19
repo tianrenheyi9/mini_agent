@@ -65,6 +65,12 @@ LLM_MODEL=deepseek-chat
 
 # Agent 运行参数
 LLM_TIMEOUT_SECONDS=60
+# 温度与输出上限；留空表示不发送该参数（兼容不支持这些参数的模型）
+LLM_TEMPERATURE=0
+LLM_MAX_TOKENS=1024
+# 开启后发送 response_format={"type": "json_object"}；部分兼容服务不支持
+LLM_JSON_MODE=false
+
 TOOL_TIMEOUT_SECONDS=10       # 单个工具执行超时
 MAX_TOOL_STEPS=8              # 单轮用户输入内最多几次 LLM/工具步骤
 CONTEXT_TOKEN_BUDGET=6000     # 估算 token 超过该值时触发压缩

@@ -75,6 +75,9 @@ def make_settings(**overrides: Any) -> Settings:
         "llm_api_key": "test-key",
         "llm_model": "test-model",
         "llm_timeout_seconds": 5.0,
+        "llm_temperature": 0.0,
+        "llm_max_tokens": 1024,
+        "llm_json_mode": False,
     }
     values.update(overrides)
     return replace(get_settings(), **values)
@@ -139,6 +142,42 @@ async def test_client_is_created_with_settings(monkeypatch: pytest.MonkeyPatch) 
     assert result.content == "ok"
 
 
+async def test_per_call_parameters_override_defaults() -> None:
+    """调用方传入的参数应覆盖 Settings 中的全局默认值。"""
+    fake = FakeOpenAI([success_completion("ok")])
+    client = LLMClient(make_settings(), client=fake)
+
+    await client.chat(
+        [{"role": "user", "content": "hi"}],
+        temperature=0.7,
+        max_tokens=256,
+        json_mode=True,
+    )
+
+    call = fake.chat.completions.calls[0]
+    assert call["temperature"] == 0.7
+    assert call["max_tokens"] == 256
+    assert call["response_format"] == {"type": "json_object"}
+
+
+async def test_global_json_mode_and_omitted_parameters() -> None:
+    """JSON 模式可全局开启；温度/上限为空时不传这些参数。"""
+    fake = FakeOpenAI([success_completion("ok")])
+    settings = make_settings(
+        llm_temperature=None,
+        llm_max_tokens=None,
+        llm_json_mode=True,
+    )
+    client = LLMClient(settings, client=fake)
+
+    await client.chat([{"role": "user", "content": "hi"}])
+
+    call = fake.chat.completions.calls[0]
+    assert "temperature" not in call
+    assert "max_tokens" not in call
+    assert call["response_format"] == {"type": "json_object"}
+
+
 async def test_success_request_and_response() -> None:
     """成功路径：传给 SDK 的参数正确，响应字段被完整解析。"""
     fake = FakeOpenAI([success_completion("你好")])
@@ -150,6 +189,8 @@ async def test_success_request_and_response() -> None:
     assert call["model"] == "test-model"
     assert call["messages"] == [{"role": "user", "content": "hi"}]
     assert call["temperature"] == 0.0
+    assert call["max_tokens"] == 1024
+    assert "response_format" not in call
     assert call["stream"] is False
 
     assert result.content == "你好"

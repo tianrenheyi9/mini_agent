@@ -55,6 +55,51 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number, got {raw!r}") from exc
 
 
+def _env_optional_float(name: str, default: float | None) -> float | None:
+    """
+    读取可为空的浮点配置。
+
+    - 变量不存在：使用默认值；
+    - 变量存在但为空字符串：返回 None，表示“不向模型发送这个参数”；
+    - 其他情况：正常解析。
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    if not raw.strip():
+        return None
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+
+
+def _env_optional_int(name: str, default: int | None) -> int | None:
+    """读取可为空的整数配置，空字符串表示不发送该参数。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    if not raw.strip():
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """读取布尔配置，支持 true/false、1/0、yes/no、on/off。"""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean, got {raw!r}")
+
+
 @dataclass(frozen=True)
 class Settings:
     """
@@ -68,6 +113,9 @@ class Settings:
     llm_api_key: str
     llm_model: str
     llm_timeout_seconds: float
+    llm_temperature: float | None
+    llm_max_tokens: int | None
+    llm_json_mode: bool
     tool_timeout_seconds: float
     max_tool_steps: int
     context_token_budget: int
@@ -105,6 +153,9 @@ def get_settings() -> Settings:
         llm_api_key=_env_str("LLM_API_KEY"),
         llm_model=_env_str("LLM_MODEL"),
         llm_timeout_seconds=_env_float("LLM_TIMEOUT_SECONDS", 60.0),
+        llm_temperature=_env_optional_float("LLM_TEMPERATURE", 0.0),
+        llm_max_tokens=_env_optional_int("LLM_MAX_TOKENS", 1024),
+        llm_json_mode=_env_bool("LLM_JSON_MODE", False),
         tool_timeout_seconds=_env_float("TOOL_TIMEOUT_SECONDS", 10.0),
         max_tool_steps=_env_int("MAX_TOOL_STEPS", 8),
         context_token_budget=_env_int("CONTEXT_TOKEN_BUDGET", 6000),
