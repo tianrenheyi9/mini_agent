@@ -1,4 +1,4 @@
-# 省心购 Vibe Coding · 最小可用 Agent
+# Vibe Coding · 最小可用 Agent
 
 一个**不依赖任何 Agent 框架**（无 LangGraph / LangChain / OpenHands 等）的最小可用 Agent Runtime。
 核心循环、工具注册与调度、LLM 输出解析、Session 管理、上下文压缩、异常处理与 Trace 全部自研，底层使用 OpenAI 官方 SDK 与 Web 框架。
