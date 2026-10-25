@@ -100,7 +100,7 @@ async def delete_session(
         raise HTTPException(status_code=404, detail="会话不存在")
     return {"deleted": True}
 
-
+# 把函数注册到fastapi的接口
 @router.post("/sessions/{session_id}/messages")
 async def send_message(
     session_id: str,

@@ -96,11 +96,11 @@ class SessionStore:
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(payload)
-                handle.flush()
+                handle.write(payload) # 1. 写进 Python 的用户态缓冲区
+                handle.flush() # 2. 把缓冲区交给操作系统的页缓存（page cache）
                 # 尽量确保数据真正落盘，再替换目标文件。
-                os.fsync(handle.fileno())
-            os.replace(temp_name, target)
+                os.fsync(handle.fileno()) # 3. 请求操作系统真正刷到磁盘
+            os.replace(temp_name, target) # 4. 原子地把临时文件改名为目标文件
         except BaseException:
             # 任何一步失败都要清理临时文件，避免目录里堆垃圾。
             try:

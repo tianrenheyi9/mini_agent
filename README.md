@@ -20,16 +20,13 @@
 
 1. [快速开始](#1-快速开始)
 2. [需求分析与实现对照](#2-需求分析与实现对照)
-3. [验收标准](#3-验收标准)
-4. [系统设计](#4-系统设计)
-5. [Memory 的召回时机与放置方式](#5-memory-的召回时机与放置方式)
-6. [上下文压缩策略](#6-上下文压缩策略)
-7. [异常处理](#7-异常处理)
-8. [Trace 与日志](#8-trace-与日志)
-9. [API 一览](#9-api-一览)
-10. [测试方案](#10-测试方案)
-11. [设计取舍与已知限制](#11-设计取舍与已知限制)
-12. [AI Prompt 与问题解决记录](#12-ai-prompt-与问题解决记录)
+3. [系统设计](#3-系统设计)
+4. [Memory 的召回时机与放置方式](#4-memory-的召回时机与放置方式)
+5. [上下文压缩策略](#5-上下文压缩策略)
+6. [异常处理](#6-异常处理)
+7. [测试方案](#7-测试方案)
+8. [设计取舍与已知限制](#8-设计取舍与已知限制)
+9. [AI Prompt 与问题解决记录](#9-ai-prompt-与问题解决记录)
 
 ---
 
@@ -38,7 +35,7 @@
 ### 1.1 环境要求
 
 - Python 3.11+
-- 一个可用的 OpenAI 兼容 LLM API Key（见 1.3）
+- 一个可用的 OpenAI 兼容 LLM API Key（见 1.2）
 
 ### 1.2 安装、配置与启动
 
@@ -98,46 +95,6 @@ uvicorn app.main:app --reload --port 8000
 
 打开 <http://localhost:8000>。
 
-### 1.3 Provider 配置示例
-
-| Provider | `LLM_BASE_URL` | `LLM_MODEL` 示例 |
-| --- | --- | --- |
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
-| 通义千问（兼容模式） | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
-| Moonshot | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
-| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
-
-> 只需兼容 `POST /chat/completions`（`messages` 入参、`choices[0].message.content` 出参）即可接入。
-> 项目**不使用**原生 function calling，工具决策完全由 Prompt + 自研解析器完成，因此对模型能力要求低、可移植性强。
-
-### 1.4 运行测试
-
-```bash
-pytest -q                 # 单元 + 集成（全部使用 FakeLLM，无需 API Key）
-pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置）
-```
-
-### 1.5 两个窗口的演示步骤
-
-1. 打开浏览器窗口 A，新建会话，输入：
-   > 北京今天天气怎么样？另外帮我把“给妈妈买生日礼物”记到待办里。
-   >
-   > 预期：调用 `weather` → 调用 `todo(add)` → 汇总回复。
-2. 打开浏览器窗口 B，新建会话，输入：
-   > 帮我写一份本周周报，3 条要点，并把“周五前提交周报”记到待办里。
-   >
-   > 预期：直接生成周报文本 → 调用 `todo(add)`。B 中看不到 A 的待办。
-3. 回到窗口 A，追问：
-   > 刚才记的待办是什么？
-   >
-   > 预期：调用 `todo(list)`，只返回 A 会话的待办。
-4. 在 A 继续追问：
-   > 那上海呢？
-   >
-   > 预期：带上下文工具追问，调用 `weather(上海)`。
-5. 刷新两个窗口：URL 中的 `#/s/<session_id>` 会恢复对应会话，历史消息、待办、摘要均保留。
-
 ---
 
 ## 2. 需求分析与实现对照
@@ -160,11 +117,11 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
 | 记住之前状态 / 支持追问 | 最近消息窗口 + 会话摘要 + 实时待办快照 + 当前轮工具链 |
 | 纯对话追问 | 历史 user/assistant 消息在 context 中 |
 | 带工具追问 | 历史 + 工具状态快照 + 工具目录持续可见 |
-| 哪些信息塞入 context | 见 [第 5 节](#5-memory-的召回时机与放置方式)，逐项给出放置位置与理由 |
+| 哪些信息塞入 context | 见 [第 4 节](#4-memory-的召回时机与放置方式)，逐项给出放置位置与理由 |
 | context 过长基础压缩 | token 估算超阈值时，对较旧消息做 LLM 增量摘要；失败时硬截断兜底 |
 | 基本异常处理 | LLM 重试、解析纠错、未知工具/参数错误自纠正、工具异常回填、超步数兜底 |
 | 工具调用 trace / 执行日志 | 每次 LLM 调用、工具调用、压缩、异常都写 JSONL + 控制台日志，并在 UI 可展开查看 |
-| 测试用例 | 单元 + 集成 + 真实 LLM 冒烟 + 手工双窗口验收，见 [第 10 节](#10-测试方案) |
+| 测试用例 | 单元 + 集成 + 真实 LLM 冒烟 + 手工双窗口验收，见 [第 7 节](#7-测试方案) |
 | 真实 LLM API | 通过 OpenAI 兼容 HTTP 接口调用，无任何 mock LLM 参与线上路径 |
 | README 三件套 | 运行方式、系统设计、Memory 召回时机与放置（本文）；AI 记录见 `AI_LOG.md` |
 
@@ -248,53 +205,9 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
 
 ---
 
-## 3. 验收标准
+## 3. 系统设计
 
-> 每条 AC 都能通过自动化测试或明确的手工步骤复验。测试文件名为规划命名，实现时保持一致。
-
-| ID | 验收项 | 预期结果 | 验证方式 |
-| --- | --- | --- | --- |
-| AC-01 | 直接回复 | 无需工具的问题直接返回 `final` | `tests/agent/test_loop.py::test_direct_answer` |
-| AC-02 | 单工具调用 | 调用 `calculator` 后基于结果回复，并使用 user observation 回填 | `tests/agent/test_loop.py::test_single_tool_and_observation_format` |
-| AC-03 | 多工具串联 | 一轮内 `weather` → `todo(add)` → 汇总 | `tests/agent/test_loop.py::test_multi_step_tool_chain` |
-| AC-04 | 工具注册与 Schema | 注册表含 4 个工具；缺失必填/类型错误被拒绝 | `tests/tools/test_schema.py` / `test_registry.py` |
-| AC-05 | todo 持久化 | 新增/完成/删除/列表跨轮、跨请求生效 | `tests/tools/test_todo.py` |
-| AC-06 | 会话隔离 | A/B 交错发消息，待办与历史互不污染 | `tests/session/test_manager.py::test_sessions_are_isolated` |
-| AC-07 | 会话恢复 | 重新从磁盘加载后历史完整，可继续对话 | `tests/session/test_manager.py::test_locked_persists_changes` / `test_store.py::test_save_and_load_roundtrip` |
-| AC-08 | 纯对话追问 | 多轮指代（“那上海呢”）能利用历史 | `tests/agent/test_loop.py::test_pure_chat_follow_up` |
-| AC-09 | 带工具追问 | 追问触发正确工具且参数来自待办快照 | `tests/agent/test_loop.py::test_tool_follow_up` |
-| AC-10 | 工具次数上限 | 执行 `MAX_TOOL_CALLS` 次后仍保留一次 final 机会；模型无视提示再次要工具才兜底 | `tests/agent/test_loop.py::test_tool_limit_keeps_final_chance` / `test_tool_limit_ignored_finalizes` |
-| AC-11 | 上下文压缩 | 超预算触发摘要；最近窗口保留；游标推进 | `tests/agent/test_context.py::test_compress_updates_summary_cursor_and_stats` |
-| AC-12 | 压缩兜底 | 摘要 LLM 失败时降级且不中断对话 | `tests/agent/test_context.py::test_compress_falls_back_when_summary_llm_fails` |
-| AC-13 | 解析容错 | 代码围栏、前后缀文本、嵌套大括号、非法 JSON | `tests/agent/test_parser.py` |
-| AC-14 | 未知工具自纠正 | 回填可用工具列表，模型下一轮改正 | `tests/agent/test_loop.py::test_unknown_tool_self_correct` |
-| AC-15 | 工具异常 | 业务异常转为 observation，不中断本轮 | `tests/agent/test_loop.py::test_tool_error_continues` |
-| AC-16 | LLM 异常 | 未配置/服务不可用返回可读提示，并写 final | `tests/agent/test_loop.py::test_llm_errors_produce_readable_reply` |
-| AC-17 | Trace | LLM/工具/压缩事件均落 JSONL，含耗时与状态 | `tests/test_trace.py` |
-| AC-18 | API 契约 | 创建/列表/详情/发消息/删除/Trace/404/422 | `tests/test_api.py` |
-| AC-19 | 真实 LLM | 通过 AgentLoop 调用 calculator 与 todo 并最终回答 | `tests/agent/test_live_agent.py`（`-m live`） |
-| AC-20 | 双窗口演示 | 浏览器中新建两个会话、交错对话、刷新恢复 | 手工，已按 4.8 节验证 |
-| AC-21 | 工具结果回填格式 | 不使用缺少 `tool_call_id` 的 `role="tool"`；assistant 原始协议 + user observation | `tests/agent/test_loop.py::test_single_tool_and_observation_format` |
-| AC-22 | 压缩游标 | 第二次压缩只处理游标之后的新消息，不重复摘要 | `tests/agent/test_context.py::test_second_compression_does_not_repeat_cursor` |
-| AC-23 | 分类统计 | LLM 调用、工具调用、压缩次数与 token 分别统计并累计 | `tests/agent/test_loop.py::test_turn_stats` |
-| AC-24 | Calculator 资源上限 | 嵌套乘方在执行前按预估位宽拒绝 | `tests/tools/test_calculator.py::test_nested_power_rejected_before_computation` |
-| AC-25 | 上下文硬边界 | System + 当前用户消息仍超预算时返回 `context_overflow` | `tests/agent/test_context.py::test_build_raises_when_current_turn_exceeds_budget` |
-| AC-26 | 轮次级硬截断 | 从最旧历史开始按完整轮次删除，不破坏 User/Final 配对 | `tests/agent/test_context.py::test_build_trims_by_complete_turn` |
-| AC-27 | Trace 故障隔离 | Trace 写盘/读取失败只记日志，不影响 Agent 回复 | `tests/test_trace.py::test_write_failure_is_isolated` |
-| AC-28 | 客户端复用与 JSON Mode | LLM 客户端复用并在 shutdown 关闭；摘要显式关闭 JSON Mode | `tests/llm/test_llm.py::test_client_is_created_with_settings` / `tests/agent/test_context.py::test_compress_updates_summary_cursor_and_stats` |
-| AC-29 | 当前轮 observation 预算 | 长工具结果先分级截断/省略，不因工具输出让用户收到“输入过长” | `tests/agent/test_context.py::test_current_turn_observations_are_compacted` / `tests/agent/test_loop.py::test_large_tool_output_is_compacted` |
-| AC-30 | 多会话并发 | 不同 Session 的请求可同时执行；前端发送状态按 Session 独立维护 | `tests/agent/test_loop.py::test_two_sessions_run_concurrently` + 浏览器手工验证 |
-
-> **2026-10-19 验收结果**：AC-01~AC-30 全部通过。
-> - 自动化：`pytest -q` → **200 passed, 2 deselected**
-> - 真实模型：`pytest -m live -q` → **2 passed**
-> - AC-20 / AC-30 已在浏览器中实际验证：calculator + todo、工具时间线、刷新恢复、双会话隔离、A 思考时 B 可正常发送。
-
----
-
-## 4. 系统设计
-
-### 4.1 总体架构
+### 3.1 总体架构
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
@@ -329,7 +242,7 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 一次用户请求的时序
+### 3.2 一次用户请求的时序
 
 ```text
 用户 ──▶ POST /messages
@@ -350,81 +263,31 @@ pytest -q -m live         # 真实 LLM + Agent 联调测试（需要 .env 配置
           └─ 6. 释放锁，更新统计，写 Trace，返回 reply + steps
 ```
 
-### 4.3 Agent Loop（伪代码）
+### 3.3 Agent Loop（流程图）
 
-```python
-async def run_turn(session, user_text):
-    turn = Turn(turn_id=session.new_turn_id())
-    session.append_user(user_text, turn.id)
-
-    # 压缩按游标增量进行，并受 MAX_COMPRESSION_CALLS_PER_TURN 限制
-    if context.over_budget(session):
-        await context.compress(
-            session,
-            turn,
-            budget=config.MAX_COMPRESSION_CALLS_PER_TURN,
-        )
-
-    # 循环上限是 LLM 调用总数，不是工具次数
-    tool_limit_notified = False
-    for step in range(config.MAX_LLM_CALLS_PER_TURN):
-        if turn.llm_calls >= config.MAX_LLM_CALLS_PER_TURN:
-            return graceful("本轮 LLM 调用次数已达上限，先给出阶段性结果。")
-
-        messages = context.build(session, turn.id)
-        response = await llm.chat(messages)      # SDK 内部处理超时/重试
-
-        turn.llm_calls += 1
-        turn.prompt_tokens += response.prompt_tokens or 0
-        turn.completion_tokens += response.completion_tokens or 0
-        trace.llm_call(turn, step, response)
-
-        parsed = parser.parse(response.content)
-
-        if isinstance(parsed, FinalAnswer):
-            session.append_assistant_final(parsed, turn.id)
-            return TurnResult(reply=parsed.final, steps=turn.steps, stats=turn.stats)
-
-        if isinstance(parsed, ParseError):
-            if turn.repairs >= config.MAX_PARSE_REPAIRS:
-                return graceful("模型输出格式异常，请重试。")
-            turn.repairs += 1
-            session.append_assistant_raw(response.content, turn.id)
-            session.append_user(
-                build_repair_message(response.content, parsed.reason),
-                turn.id,
-                kind="repair",
-            )
-            continue
-
-        # 工具次数独立限制；最后一次工具之后仍保留 final 机会
-        if turn.tool_calls >= config.MAX_TOOL_CALLS:
-            if tool_limit_notified:
-                return graceful("已达到单轮最大工具调用次数，先给你阶段性结果。")
-            tool_limit_notified = True
-            session.append_user(
-                "工具调用次数已达上限，请不要再调用工具，直接输出 final。",
-                turn.id,
-                kind="repair",
-            )
-            continue
-
-        session.append_assistant_tool_call(parsed, response.content, turn.id)
-        result = await registry.execute(
-            name=parsed.action,
-            raw_input=parsed.input,
-            context=ToolContext(session_id=session.id, todos=session.todos),
-        )
-
-        turn.tool_calls += 1
-        session.append_tool_observation(parsed, result, turn.id)
-        trace.tool_call(turn, step, parsed, result)
-
-        # 工具结果可能很长：执行后再次检查旧历史是否需要压缩
-        await context.maybe_compress(session, turn.id, turn.stats)
-
-    return graceful("本轮 LLM 调用次数已达上限，先给你阶段性结果。")
+```mermaid
+flowchart TD
+    A["接收输入<br/>加锁 + append user"] --> B["压缩旧历史"]
+    B --> C{"LLM 调用次数达上限？"}
+    C -->|是| Z["finish<br/>错误 / 达到上限"]
+    C -->|否| D["context.build()<br/>超预算 → finish"]
+    D --> E["llm.chat()<br/>失败 → finish"]
+    E --> F["parser.parse()"]
+    F --> G{"解析结果"}
+    G -->|FinalAnswer| OK["finish: ok"]
+    G -->|ParseError| H{"纠错达上限？"}
+    H -->|是| Z
+    H -->|否| I["追加 repair 提示"]
+    I --> B
+    G -->|ToolCall| J{"工具次数达上限？"}
+    J -->|是，已提示| Z
+    J -->|是，未提示| K["提示直接 final"]
+    K --> B
+    J -->|否| L["执行工具<br/>追加 observation"]
+    L --> B
 ```
+
+节点内的“→ finish”表示该阶段失败会直接进入统一收尾；具体 `status` 见下方终止条件。两个预算互不混用：`MAX_LLM_CALLS_PER_TURN` 限制总 LLM 调用，`MAX_TOOL_CALLS` 限制实际工具执行。
 
 **终止条件**（任一满足）：
 
@@ -438,7 +301,7 @@ async def run_turn(session, user_text):
 
 **统计口径**：`TurnStats` 分开记录 `llm_calls`、`tool_calls`、`compression_calls`、`prompt_tokens`、`completion_tokens`；Session 再累计一份，供 Trace 和 UI 展示。
 
-### 4.4 LLM 输出协议与解析器
+### 3.4 LLM 输出协议与解析器
 
 **协议**：模型每轮只能输出一个 JSON 对象。
 
@@ -479,7 +342,7 @@ async def run_turn(session, user_text):
 - 不依赖特定厂商的 tools 能力，任何 OpenAI 兼容模型都能跑；
 - `thought` 字段让思考过程显式可观测，便于 UI 展示与调试。
 
-#### 4.4.1 工具结果如何回填（重要）
+#### 3.4.1 工具结果如何回填（重要）
 
 自定义 JSON 协议**不是** OpenAI 原生 `tool_calls`。因此不能直接发送：
 
@@ -529,7 +392,7 @@ error: 城市不能为空
 
 **不要同时使用 `role="tool"` 和自定义协议**：那会形成一套不完整的原生工具调用消息，容易导致 API 报错或模型混淆。
 
-### 4.5 工具系统
+### 3.5 工具系统
 
 **注册机制**：
 
@@ -572,7 +435,7 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 
 即：待办既通过工具修改，又通过**每轮实时快照**进入上下文。模型不需要“记住”待办，避免状态漂移。
 
-### 4.6 Session 管理
+### 3.6 Session 管理
 
 **数据模型**（`data/sessions/<session_id>.json`）：
 
@@ -655,7 +518,7 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 
 **首条消息生成标题**：取首条用户消息前 20 个字符作为标题（失败/为空则“新会话”），无需额外 LLM 调用。
 
-### 4.7 Web 交互
+### 3.7 Web 交互
 
 - 左侧 Session 列表：标题、消息数、未完成待办数、更新时间、新建/删除；当前会话高亮；
 - 右侧聊天区：用户消息与 Agent 回复分栏展示；回复支持段落、列表、粗体、行内代码的**安全轻量渲染**；
@@ -672,7 +535,7 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 - 移动端侧栏自动收起为抽屉；
 - 无构建步骤：FastAPI `StaticFiles` 直接托管 `app/web/`（原生 HTML/CSS/JS）。
 
-### 4.8 端到端验证
+### 3.8 端到端验证
 
 真实模型 `qwen3.8-max` 下已在浏览器中验证：
 
@@ -691,11 +554,11 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 
 ---
 
-## 5. Memory 的召回时机与放置方式
+## 4. Memory 的召回时机与放置方式
 
 本项目的 “memory” 指**会话内记忆**。Session 是记忆的隔离边界：跨 Session 不共享任何上下文或状态（符合题目“窗口 1 / 窗口 2 互不影响”）。
 
-### 5.1 信息放置总表
+### 4.1 信息放置总表
 
 | 信息 | 存储位置 | 进入上下文的位置 | 召回时机 | 为什么放这里 |
 | --- | --- | --- | --- | --- |
@@ -714,7 +577,7 @@ UI 会话侧栏/详情 ◀── 直接读取 session.todos
 | **历史轮的 thought** | `session.messages`（供 UI/Trace） | **不进入上下文** | 不召回 | 思考过程只对当轮决策有效，历史 thought 会干扰后续 |
 | 完整 Trace | `data/traces/*.jsonl` | 不进入上下文 | 仅排障 | 可观测性数据，不属于对话记忆 |
 
-### 5.2 每轮上下文的最终形态
+### 4.2 每轮上下文的最终形态
 
 ```text
 messages = [
@@ -734,7 +597,7 @@ messages = [
 
 工具 observation 的放置方式很关键：它使用 **user 角色**并带 `[工具执行结果]` 标记，而不是 `role="tool"`。原因见 [4.4.1](#441-工具结果如何回填重要)。
 
-### 5.3 追问为什么能工作
+### 4.3 追问为什么能工作
 
 - **纯对话追问**（“那上海呢？”）：
   最近消息窗口里保留上一轮的 `user: 北京天气…` 与 `assistant: 北京今天…`，模型可解析指代，直接输出 `final` 或再次调用工具。
@@ -743,7 +606,7 @@ messages = [
 - **跨轮状态**（“把刚才那条标记完成”）：
   待办 id 在快照中持续可见，模型可用 `todo(complete, id=...)` 精确操作。
 
-### 5.4 召回时机一句话总结
+### 4.4 召回时机一句话总结
 
 > **每轮请求开始时召回一次**：从磁盘加载会话 → 估算上下文 → 必要时压缩 → 将「摘要 + 待办快照 + 工具目录 + 最近对话 + 当前轮」组装为 prompt。
 > **轮内每次 LLM 调用重新组装一次**：追加当前轮新增的 assistant 工具调用与 observation。
@@ -751,9 +614,9 @@ messages = [
 
 ---
 
-## 6. 上下文压缩策略
+## 5. 上下文压缩策略
 
-### 6.1 触发条件
+### 5.1 触发条件
 
 满足任一即触发（在追加当前用户消息之后、进入循环之前）：
 
@@ -770,7 +633,7 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 `TOKEN_SAFETY_FACTOR`（默认 1.2）用于吸收不同厂商 tokenizer 的偏差。
 估算只用于触发阈值，实际精度不影响正确性；API 返回的 `usage.prompt_tokens` 会用于统计对账。
 
-### 6.2 压缩算法（基础版）
+### 5.2 压缩算法（基础版）
 
 ```text
 保留：最近 KEEP_RECENT_MESSAGES（默认 8）条已完成消息
@@ -811,13 +674,13 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 - 只有 System + 当前用户消息本身仍超预算时，才抛 `ContextBudgetExceeded`，Agent 返回 `context_overflow`；
 - 每次工具执行后再次检查压缩，避免长工具结果把上下文撑大。
 
-### 6.3 不做的复杂压缩
+### 5.3 不做的复杂压缩
 
 按题目要求，不实现：向量检索记忆、分层摘要树、重要度打分、工具结果语义去重。README 中将其列为后续可扩展方向。
 
 ---
 
-## 7. 异常处理
+## 6. 异常处理
 
 | 场景 | 处理 | 用户感知 |
 | --- | --- | --- |
@@ -846,93 +709,9 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 
 ---
 
-## 8. Trace 与日志
+## 7. 测试方案
 
-### 8.1 Trace 文件
-
-`data/traces/<session_id>.jsonl`，每次请求的每个事件一行：
-
-```json
-{"ts":"2026-10-18T12:00:01.120+08:00","session_id":"s_01J...","turn_id":"u_1","step":0,"event":"llm_call","latency_ms":812,"prompt_tokens_est":932,"raw_output":"{\"thought\":...}","parsed":{"type":"tool_call","action":"weather"}}
-{"ts":"2026-10-18T12:00:01.130+08:00","session_id":"s_01J...","turn_id":"u_1","step":0,"event":"tool_call","tool":"weather","input":{"city":"北京"},"status":"ok","latency_ms":2,"result_preview":"{\"city\":\"北京\",\"temp\":\"18~26℃\"}"}
-{"ts":"2026-10-18T12:00:01.950+08:00","session_id":"s_01J...","turn_id":"u_1","step":1,"event":"llm_call","latency_ms":790,"parsed":{"type":"tool_call","action":"todo"}}
-{"ts":"2026-10-18T12:00:02.001+08:00","session_id":"s_01J...","turn_id":"u_1","step":1,"event":"tool_call","tool":"todo","input":{"action":"add","content":"给妈妈买生日礼物"},"status":"ok"}
-{"ts":"2026-10-18T12:00:02.300+08:00","session_id":"s_01J...","turn_id":"u_1","event":"compress","before_tokens_est":7200,"after_tokens_est":4100,"summarized_messages":6,"summary_until_msg_id":"m_12","fallback":null}
-{"ts":"2026-10-18T12:00:02.900+08:00","session_id":"s_01J...","turn_id":"u_1","step":2,"event":"llm_call","parsed":{"type":"final"}}
-{"ts":"2026-10-18T12:00:02.901+08:00","session_id":"s_01J...","turn_id":"u_1","event":"turn_end","status":"ok","steps":2,"llm_calls":3,"tool_calls":2,"compression_calls":1,"prompt_tokens":1832,"completion_tokens":210,"latency_ms":1801}
-```
-
-### 8.2 日志输出
-
-- `logging` 标准库，INFO 级别输出：请求开始/结束、工具调用、压缩触发、异常摘要；
-- Trace 与日志共用同一 `turn_id`，便于串联排障；
-- 敏感信息（API Key）不落日志；原始 LLM 输出最多保留 2000 字符。
-
-### 8.3 UI 展示
-
-`POST /messages` 的响应包含本轮 `steps`，前端在 assistant 消息下渲染可折叠时间线：
-「思考 → 调用 weather(北京) → 结果 → 调用 todo(add) → 结果 → 最终回答」。
-用户能直接看到 Agent 的决策过程，满足“提取思考过程”的可观测要求。
-
----
-
-## 9. API 一览
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| `GET` | `/api/health` | 健康检查与当前模型配置（不含 Key） |
-| `POST` | `/api/sessions` | 新建会话，返回会话元数据（`id/title/...`） |
-| `GET` | `/api/sessions` | 会话列表（id、title、updated_at、todo 未完成数） |
-| `GET` | `/api/sessions/{sid}` | 会话详情（messages、summary、todos、stats） |
-| `DELETE` | `/api/sessions/{sid}` | 删除会话及其 Trace |
-| `POST` | `/api/sessions/{sid}/messages` | 发送消息，执行完整 Agent 轮次 |
-| `GET` | `/api/sessions/{sid}/traces?limit=50` | 最近 Trace（1~500 条） |
-
-发送消息请求/响应：
-
-```json
-// POST /api/sessions/s_01J.../messages
-{ "content": "北京天气怎么样？顺便记个待办" }
-
-// 200
-{
-  "session_id": "s_01J...",
-  "turn_id": "u_...",
-  "reply": "北京今天 18~26℃，多云。已记入待办。",
-  "thought": "先查天气，再记录待办，最后汇总。",
-  "steps": [
-    { "type": "tool", "step": 0, "tool": "weather", "input": { "city": "北京" },
-      "status": "ok", "duration_ms": 2, "result": { "city": "北京", "temperature": "18~26℃" },
-      "thought": "先查天气" },
-    { "type": "tool", "step": 1, "tool": "todo", "input": { "action": "add", "content": "买牛奶" },
-      "status": "ok", "duration_ms": 1, "result": { "todo": { "id": "t_3" } },
-      "thought": "记录待办" }
-  ],
-  "stats": {
-    "llm_calls": 3,
-    "tool_calls": 2,
-    "compression_calls": 0,
-    "prompt_tokens": 1000,
-    "completion_tokens": 120,
-    "compression_prompt_tokens": 0,
-    "compression_completion_tokens": 0
-  },
-  "status": "ok",
-  "compression": { "compressed": false, "summarized_messages": 0 }
-}
-```
-
-错误响应统一：
-
-```json
-{ "error": { "code": "SESSION_NOT_FOUND", "message": "会话不存在" } }
-```
-
----
-
-## 10. 测试方案
-
-### 10.1 分层
+### 7.1 分层
 
 | 层级 | 对象 | 方式 |
 | --- | --- | --- |
@@ -941,10 +720,10 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 | 集成 | SessionManager + 存储 + ContextBuilder | 临时目录，落盘/重载/隔离/压缩 |
 | API | FastAPI 路由 | `TestClient` |
 | 真实 | 真实 OpenAI 兼容接口 | `pytest -m live`，无 Key 自动跳过 |
-| 手工 | 双窗口交互 | 按 1.5 节步骤 |
-| 端到端 | 浏览器 + 真实模型 | 已按 4.8 节在 UI 中实际验证 calculator + todo、刷新恢复与双会话隔离 |
+| 手工 | 双窗口交互 | 手工打开两个浏览器窗口验证 |
+| 端到端 | 浏览器 + 真实模型 | 已按 3.8 节在 UI 中实际验证 calculator + todo、刷新恢复与双会话隔离 |
 
-### 10.2 核心测试用例
+### 7.2 核心测试用例
 
 **解析器**
 - 纯 JSON / ```json 围栏 / 前后有解释文字；
@@ -1010,16 +789,17 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 **真实 LLM**
 - `tests/agent/test_live_agent.py` 通过 `AgentLoop.run_turn()` 发送“计算 2 的 10 次方并记一条待办”；
 - 断言 calculator 与 todo 都实际执行、最终回复包含 `1024`、todo 落盘；
+- `tests/agent/test_live_scenario.py` 用 9 轮会议筹备故事覆盖真实多轮：weather/search/calculator/todo、改需求、纯对话召回、1/0 工具错误、压缩、双会话并发和磁盘重载；核心不变量断言，模型行为差异打印为诊断项；
 - **仅调用 `LLMClient.chat()` 回复“你好”不算 Agent 工具调用验收**；live 测试必须走完整循环。
 
-### 10.3 FakeLLM 设计
+### 7.3 FakeLLM 设计
 
 - 实现与 `LLMClient` 相同的 `chat(messages) -> str` 接口；
 - 按顺序返回预设响应，并记录收到的 messages，供断言上下文内容；
 - 支持注入异常（超时、5xx）与延迟；
 - 使 Agent 循环、压缩、异常路径全部可在无网络、无 API Key 的情况下确定性测试。
 
-### 10.4 Web UI 手工验收清单
+### 7.4 Web UI 手工验收清单
 
 | 项目 | 状态 | 说明 |
 | --- | --- | --- |
@@ -1048,6 +828,8 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 
 ---
 
+## 8. 设计取舍与已知限制
+
 | 取舍 | 决定 | 原因 / 代价 |
 | --- | --- | --- |
 | 工具协议 | 自研 JSON 协议 | 满足“自行解析”要求、可移植；代价是比原生 tool calling 多一层纠错 |
@@ -1069,7 +851,7 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 
 ---
 
-## 12. AI Prompt 与问题解决记录
+## 9. AI Prompt 与问题解决记录
 
 完整记录见 [`AI_LOG.md`](./AI_LOG.md)，内容包括：
 
@@ -1085,5 +867,5 @@ estimate = ceil(raw × TOKEN_SAFETY_FACTOR)
 - [x] 源码（自研 Agent Runtime，无 Agent 框架依赖）
 - [x] `README.md`：运行方式、系统设计、Memory 召回时机与放置方式
 - [x] `AI_LOG.md`：AI Prompt 与问题解决记录
-- [x] 测试用例与运行结果：`pytest -q` → 199 passed；`pytest -m live -q` → 2 passed；浏览器端到端已复验
+- [x] 测试用例与运行结果：`pytest -q` → 200 passed, 3 deselected；`pytest -m live -q` → 3 passed；浏览器端到端已复验
 - [x] GitHub 仓库链接：<https://github.com/tianrenheyi9/mini_agent>
